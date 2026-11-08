@@ -813,8 +813,14 @@ impl Receiver {
     }
 
     fn control_pause(&self, paused: bool, actions: &mut Vec<ReceiverAction>) {
-        if let Some(generation) = self.playing_generation() {
-            actions.push(ReceiverAction::SetPaused { generation, paused });
+        // A no-op must stay one: re-pausing would back up `pause=yes` per file.
+        if let PlaybackState::Playing(snapshot) = &self.playback
+            && snapshot.paused != paused
+        {
+            actions.push(ReceiverAction::SetPaused {
+                generation: snapshot.generation,
+                paused,
+            });
         }
     }
 
@@ -1218,6 +1224,25 @@ mod tests {
             vec![ReceiverAction::SetMuted {
                 generation: g,
                 muted: false
+            }]
+        );
+    }
+
+    #[test]
+    fn pause_control_matching_the_confirmed_state_is_a_no_op() {
+        let mut r = Receiver::new();
+        let g = begin_playing(&mut r, "a", 70);
+        assert!(r.handle(ReceiverEvent::RemoteResume).is_empty());
+        r.handle(ReceiverEvent::PlayerPauseChanged {
+            generation: g,
+            paused: true,
+        });
+        assert!(r.handle(ReceiverEvent::RemotePause).is_empty());
+        assert_eq!(
+            r.handle(ReceiverEvent::RemoteResume),
+            vec![ReceiverAction::SetPaused {
+                generation: g,
+                paused: false
             }]
         );
     }

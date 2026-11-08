@@ -453,7 +453,11 @@ impl Runtime {
                 self.mpv.hook_continue(hook_id);
             }
             ReceiverAction::AbortLoad { hook_id } => self.mpv.hook_continue(hook_id),
-            ReceiverAction::SetPaused { paused, .. } => self.set("file-local-options/pause", yes_no(paused)),
+            ReceiverAction::SetPaused { paused: true, .. } => {
+                self.set("file-local-options/pause", "yes");
+            }
+            // Plain: a file-local `no` would restore a local pause when the item ends.
+            ReceiverAction::SetPaused { paused: false, .. } => self.set("pause", "no"),
             ReceiverAction::Seek { position, .. } => {
                 self.run(&["seek", &adapter::format_seconds(position), "absolute"]);
             }

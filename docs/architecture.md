@@ -73,7 +73,7 @@ so mpv's own playlist is the queue and the user's next/previous keys work.
    item whose start was reported.
 
 Nothing mpvfin sets outlives the item, except volume and mute, which a remote
-is meant to change.
+is meant to change, and a remote unpause, which clears the user's own pause.
 
 ## Local auth proxy
 
@@ -106,8 +106,9 @@ every five seconds, so they take over when the first closes.
    media loading.
 7. A `file-loaded` event correlated to the current generation marks playback
    ready; media duration is not a readiness signal.
-8. The plugin never sets a global mpv option, apart from the volume and mute
-   a remote asks for. No token reaches a URL, property, argument or log.
+8. The plugin never sets a global mpv option, apart from the volume, mute and
+   unpause a remote asks for. No token reaches a URL, property, argument or
+   log.
 
 ## Workspace
 

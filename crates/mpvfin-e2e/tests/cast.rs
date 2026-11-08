@@ -261,6 +261,25 @@ fn local_pause_and_seek_are_reported() {
 
 #[test]
 #[ignore = "needs ./scripts/test-server.ps1 -Action up"]
+fn local_pause_then_remote_unpause_does_not_pause_the_next_item() {
+    let c = cast();
+    let ids: Vec<&str> = c.items.iter().map(String::as_str).collect();
+    c.server.play(&c.session, &ids, 0, Duration::ZERO);
+    c.wait_playing(ids[0]);
+
+    c.player.command(&["set", "pause", "yes"]);
+    c.session_where(|s| s["PlayState"]["IsPaused"] == true);
+    c.server.playstate(&c.session, "Unpause", None);
+    c.session_where(|s| s["PlayState"]["IsPaused"] == false);
+    c.wait_mpv("pause", &json!(false));
+
+    c.server.playstate(&c.session, "NextTrack", None);
+    c.wait_playing(ids[1]);
+    assert_eq!(c.player.get("pause"), json!(false));
+}
+
+#[test]
+#[ignore = "needs ./scripts/test-server.ps1 -Action up"]
 fn remote_track_changes_select_mpv_tracks() {
     let c = cast();
     c.play_one(&c.items[0], Duration::ZERO);

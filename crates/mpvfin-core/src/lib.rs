@@ -818,20 +818,16 @@ impl Receiver {
         }
     }
 
-    /// Goes idle. Resolving continues its hook with an abort; Loading and
-    /// Playing report a stop. mpv owns the actual entry, so no `StopPlayer`.
+    /// Goes idle. Resolving continues its hook with an abort; Playing reports
+    /// a stop. mpv owns the actual entry, so no `StopPlayer`.
     fn terminate_current(&mut self, reason: StopReason, actions: &mut Vec<ReceiverAction>) {
         match mem::take(&mut self.playback) {
-            PlaybackState::Idle => {}
+            // Loading sent no `ReportStarted`, and a stop without a start
+            // resets the item's resume position on the server.
+            PlaybackState::Idle | PlaybackState::Loading { .. } => {}
             PlaybackState::Resolving { token, .. } => {
                 actions.push(ReceiverAction::AbortLoad {
                     hook_id: token.hook_id,
-                });
-            }
-            PlaybackState::Loading { generation, media } => {
-                actions.push(ReceiverAction::ReportStopped {
-                    snapshot: Self::initial_snapshot(generation, &media),
-                    reason,
                 });
             }
             PlaybackState::Playing(snapshot) => {
@@ -1092,6 +1088,59 @@ mod tests {
                 ..
             }]
         ));
+    }
+
+    fn begin_loading(r: &mut Receiver, item: &str, hook: u64) -> Generation {
+        let g = match open(r, item, hook).as_slice() {
+            [ReceiverAction::ResolveMedia { generation, .. }] => *generation,
+            other => panic!("unexpected actions: {other:?}"),
+        };
+        resolve(r, g, item);
+        g
+    }
+
+    #[test]
+    fn next_entry_while_loading_reports_nothing() {
+        let mut r = Receiver::new();
+        begin_loading(&mut r, "a", 70);
+        assert!(matches!(
+            open(&mut r, "b", 80).as_slice(),
+            [ReceiverAction::ResolveMedia { token, .. }] if token.hook_id == 80
+        ));
+    }
+
+    #[test]
+    fn shutdown_while_loading_reports_nothing() {
+        let mut r = Receiver::new();
+        begin_loading(&mut r, "a", 70);
+        assert!(r.handle(ReceiverEvent::Shutdown).is_empty());
+        assert_eq!(r.playback(), &PlaybackState::Idle);
+    }
+
+    #[test]
+    fn remote_stop_while_loading_stops_player_and_reports_nothing() {
+        let mut r = Receiver::new();
+        let g = begin_loading(&mut r, "a", 70);
+        assert_eq!(
+            r.handle(ReceiverEvent::RemoteStop),
+            vec![ReceiverAction::StopPlayer { generation: g }]
+        );
+        assert!(r.handle(ended(g, EndReason::Stopped)).is_empty());
+        assert_eq!(r.playback(), &PlaybackState::Idle);
+    }
+
+    #[test]
+    fn failed_end_while_loading_only_surfaces_the_error() {
+        let mut r = Receiver::new();
+        let g = begin_loading(&mut r, "a", 70);
+        assert_eq!(
+            r.handle(ended(g, EndReason::Failed("x".into()))),
+            vec![ReceiverAction::PlaybackFailed {
+                generation: g,
+                item_id: "a".into(),
+                message: "x".into()
+            }]
+        );
     }
 
     #[test]

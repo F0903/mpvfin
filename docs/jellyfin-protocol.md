@@ -80,8 +80,10 @@ Serialize reports for each playback generation in this order:
 1. `POST /Sessions/Playing` after mpv confirms `file-loaded`.
 2. `POST /Sessions/Playing/Progress` about every ten seconds and immediately
    after player-confirmed pause, resume, seek, volume, or mute changes.
-3. `POST /Sessions/Playing/Stopped` exactly once on EOF, replacement, remote
-   stop, load failure, or shutdown.
+3. `POST /Sessions/Playing/Stopped` exactly once after a started report, on
+   EOF, replacement, remote stop, a playback failure, or shutdown. An item
+   that never reached `file-loaded` sends no report at all: on 10.11.11 a
+   stop without a start resets the saved resume position to zero.
 
 Every asynchronous result carries its playback generation. Results for retired
 generations are ignored, including late HTTP responses and mpv events.

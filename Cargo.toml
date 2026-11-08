@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/mpvfin-core",
     "crates/mpvfin-cplugin",
+    "crates/mpvfin-jellyfin",
 ]
 
 [workspace.package]

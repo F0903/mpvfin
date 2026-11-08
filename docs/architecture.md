@@ -39,6 +39,11 @@ plugin talks to mpv.
   lock, logs in, registers capabilities and holds the WebSocket, reconnecting
   with capped backoff.
 - **`jobs` thread.** Runs `Resolve` and report jobs in submission order.
+- **`group` thread.** Runs SyncPlay requests and the group list, in order, so a
+  slow report or resolve can never delay a `Ready`.
+- **`clock` thread.** Measures the offset to the server's clock with
+  `/GetUtcTime`: five samples at each connect and join, then a batch a minute
+  while in a group. It turns a command's `When` into a local delay.
 - **Proxy threads.** One accept thread, plus one per media request.
 
 Session threads pass `SessionEvent`s over a channel and call `mpv_wakeup`
@@ -103,6 +108,39 @@ seeks to the segment's end. A segment that runs to the end of the file (within
 5 s of the runtime) uses `seek 100 absolute-percent+exact` instead, so mpv
 reaches EOF and advances the playlist itself. Skipping credits also submits a
 `MarkPlayed` job, which runs on the `jobs` thread.
+
+## Watch together
+
+A group is one more source of commands for the same reducer. The server is the
+authority: mpv asks, and acts only on what comes back. The contract is
+[jellyfin-syncplay.md](jellyfin-syncplay.md).
+
+1. `script-binding mpvfin/watch-together` lists the groups on the `group`
+   thread and opens the menu, in uosc if it is running and otherwise in mpv's
+   console. Creating a group while playing publishes mpv's playlist and
+   position as the group's queue.
+2. A queue update replaces mpv's playlist. Each entry is named
+   `mpvfin://<item id>/<playlist item id>`, because an item can be queued twice.
+   The `on_load` hook adds per-file options: start paused, at the group's
+   position, and `keep-open=always` without `keep-open-pause`.
+3. When the position settles the reducer sends `Ready`. `Unpause` carries a
+   time, so the plugin starts mpv at that moment, from that position. Anything
+   mpv has to do first, such as a seek, happens while paused.
+4. Pausing, seeking or changing entry in mpv, and casting to it, become requests
+   to the group. A viewer's unpause is held back until the broadcast arrives,
+   which then applies to everyone, mpv included.
+5. At the end of an entry mpv holds, because of `keep-open`, and the plugin asks
+   for the next one, or stops the group after the last. The server has no notion
+   of an item ending.
+6. Leaving, opening a local file, or an item that cannot load takes mpv out of
+   the group; playback carries on and the entry gets the viewer's `keep-open`
+   back. After a dropped connection the session rejoins the remembered group.
+
+While playing in a group the plugin compares mpv's position with the group's
+clock, anchored at the last start. Under 120 ms is left alone. Up to 2 s, it
+changes the file-local `speed` by 5% for as long as it takes (at most 30 s), then restores it.
+Beyond 2 s it seeks. Each correction is followed by a cooldown, and a pause,
+seek or new item drops the anchor, so a viewer's seek never reads as drift.
 
 ## Local auth proxy
 

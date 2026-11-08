@@ -406,8 +406,9 @@ the group stays in its old state with no item; later commands carry the zero pid
   `PQ NextItem`, load `Playlist[PlayingItemIndex]`, then `Ready`.
 - **End of queue:** `NextItem` for the last item does nothing, sends nothing, and the group stays
   `Playing` indefinitely with position still advancing. [live] Recommended: after the last item
-  ends locally, a member sends `/SyncPlay/Stop`, which gives everyone `Stop`. [inferred] What the
-  official clients do here is open.
+  ends locally, a member sends `/SyncPlay/Stop`, which gives everyone `Stop`. [inferred] The web
+  client, alone in a group, sent no SyncPlay request at all at the end of the queue (section 14).
+  [live]
 - **Stale `NextItem`/`PreviousItem` from Playing or Paused moves the group to Waiting with no
   update and no one buffering.** It stays there until someone sends a Ready. [live] Only send them
   with the current pid.
@@ -511,9 +512,11 @@ official clients do this is open.
 
 ## 13. Open questions
 
-1. What the official clients actually send: `Ping` value (RTT or RTT/2), when they send `Buffering`,
-   whether `Ready` is ever `IsPlaying: true`, and their drift-correction thresholds.
-2. What official clients do at end of queue (send `Stop`? leave the group in Playing?).
+1. What the official clients actually send. Partly answered in section 14: `Ready` is sent with
+   `IsPlaying: true` as well as `false`. Still open: the `Ping` value (no `POST /SyncPlay/Ping` was
+   seen in a 40 s run), when `Buffering` is sent (none was), and drift-correction thresholds.
+2. What official clients do at end of queue. Answered for the web client alone in a group, in
+   section 14: it sends nothing. With other members, and for other clients, still open.
 3. Whether official clients translate a remote `Play` into `SetNewQueue` while grouped.
 4. `SyncPlayAccess: None` and `JoinGroups` behaviour and `LibraryAccessDenied` are source-only, because
    testing them means changing `partner`'s policy, which was not part of the brief.
@@ -521,3 +524,41 @@ official clients do this is open.
 6. Why SyncPlay HTTP calls (GET and POST) sometimes took seconds on the test server.
 7. Whether a server restart ends groups cleanly (groups are in-memory, so they vanish; reconnect
    behaviour not probed).
+
+## 14. Checked against the real web client
+
+2026-11-09, server 10.11.11: the server's own web client in headless Chrome (Playwright,
+`channel: 'chrome'`, `--disable-gpu`, `--autoplay-policy=no-user-gesture-required`, direct play of
+H.264) logged in as `partner`, and a real mpv running the plugin as `admin`. The web client created
+the group and played E01; mpv joined from its menu. Only the web UI was driven, and its source was
+not read. Four runs, all alike, the last after the fix to a viewer's resume. [live]
+
+| Check | Result |
+| --- | --- |
+| Browser pauses when mpv joins | within 40 ms of mpv's choice |
+| Both start after the join | 1.15 to 1.18 s after that pause |
+| Start offset, mpv minus browser | 0, -30, 0 and 0 ms (sampled about every 30 ms) |
+| Steady offset while playing, mpv minus browser | +30 to +130 ms, typically +80 ms |
+| Offset while both are paused | +9 to +56 ms |
+
+| Direction | Pause | Resume | Seek forward | Seek backward |
+| --- | --- | --- | --- | --- |
+| Browser to mpv | followed in about 50 ms | followed in about 1 s | followed in about 40 ms | followed in about 40 ms |
+| mpv to browser | followed in about 40 ms | followed in about 1 s | followed in 40 to 80 ms | followed in 40 to 80 ms |
+
+Times are from the action to the other side's change being seen. Resuming takes about 1 s because
+the server schedules it. After every action the offset returned to the steady range above.
+
+What the web client POSTs to `/SyncPlay/`, seen from its requests:
+
+- `New` with `{"GroupName":"partner's group"}`, then `SetNewQueue`. Playing E03 from its page sent
+  E03 alone; playing E01 from its page gave a queue of the three episodes.
+- `Ready` after a load with `IsPlaying: false`, then again about 1 s later with `IsPlaying: true`.
+- After a `Seek`, two `Ready` about a millisecond apart (`IsPlaying: true`, then `false`), and a
+  third with `IsPlaying: true` about 1 s later.
+- No `Ping` and no `Buffering` in a 40 s run.
+- At the end of the last item of the queue, alone in the group: no request at all, neither `Stop`
+  nor `NextItem`. The player closed and the item's page came back.
+
+Not checked: any other official client, `Buffering` under a real stall, and a remote `Play` while
+grouped (open question 3).

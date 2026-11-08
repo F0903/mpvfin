@@ -104,6 +104,15 @@ console (which needs mpv 0.39 or newer):
 If mpv's console is turned off (`load-console=no`) and uosc isn't installed, an
 OSD message says so instead.
 
+In a group, mpv follows everyone else and they follow mpv. Pause, seek, next and
+previous in mpv apply to the whole group, and so does casting something to mpv.
+When someone joins, everyone waits for them and then starts together; mpv starts
+at the moment the server schedules. At the end of an item the group moves on
+together, and the group stops after the last item.
+
+Opening a local file leaves the group. If the connection drops, mpvfin rejoins
+by itself. It has been checked against Jellyfin's web client on server 10.11.11.
+
 ## Uninstall
 
 Delete these three files from mpv's config directory; nothing else is left

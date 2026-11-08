@@ -240,6 +240,18 @@ mpvfin requests
 `EndTicks` may exceed the item's `RunTimeTicks` slightly; mpvfin treats a
 segment ending within 5 s of the runtime as running to the end of the file.
 
+## Which session a request acts for (verified against the test server)
+
+The session is keyed on the `Client` and `DeviceId` of the `Authorization`
+header, while the WebSocket finds its session through the token's device
+record. A token obtained under one `Client` value and used on HTTP under
+another therefore acts on a second session with no socket. `POST
+/SyncPlay/Join` from that session returns 204 and the group pauses for it, but
+its updates reach nobody, and it stays a member until its device is removed.
+mpvfin always logs in and connects under `Client="mpvfin"`.
+
+The SyncPlay contract is in [jellyfin-syncplay.md](jellyfin-syncplay.md).
+
 ## Marking played (verified against the test server)
 
 `POST /UserPlayedItems/{itemId}?userId={userId}` with no body returns 200 and

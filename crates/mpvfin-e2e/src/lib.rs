@@ -10,6 +10,7 @@
 use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
+use std::mem;
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -294,6 +295,100 @@ Connection: close
     );
 }
 
+/// A TCP relay to the test server whose WebSocket connections can be cut or held back,
+/// which acts on the plugin's real socket while its HTTP and media requests keep flowing.
+pub struct SocketRelay {
+    url: String,
+    sockets: Arc<Mutex<Vec<TcpStream>>>,
+    held: Arc<AtomicBool>,
+}
+
+impl SocketRelay {
+    pub fn start(server: &Server) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind relay");
+        let url = format!("http://{}", listener.local_addr().expect("relay address"));
+        let upstream = server
+            .url()
+            .trim_start_matches("http://")
+            .trim_end_matches('/')
+            .to_owned();
+        let sockets = Arc::new(Mutex::new(Vec::new()));
+        let held = Arc::new(AtomicBool::new(false));
+        let (open, on_hold) = (sockets.clone(), held.clone());
+        thread::spawn(move || {
+            for client in listener.incoming().flatten() {
+                let (upstream, open, on_hold) = (upstream.clone(), open.clone(), on_hold.clone());
+                thread::spawn(move || relay_connection(client, &upstream, &open, &on_hold));
+            }
+        });
+        Self { url, sockets, held }
+    }
+
+    /// While on, nothing the server sends over a WebSocket reaches the plugin.
+    pub fn hold_server_messages(&self, on: bool) {
+        self.held.store(on, Ordering::SeqCst);
+    }
+
+    /// The address to give the plugin instead of the server's.
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+
+    /// Cuts every WebSocket passing through; returns how many there were.
+    pub fn cut_sockets(&self) -> usize {
+        let cut = mem::take(&mut *self.sockets.lock().unwrap_or_else(PoisonError::into_inner));
+        for socket in &cut {
+            let _ = socket.shutdown(std::net::Shutdown::Both);
+        }
+        cut.len()
+    }
+}
+
+fn relay_connection(
+    client: TcpStream,
+    upstream: &str,
+    sockets: &Mutex<Vec<TcpStream>>,
+    held: &AtomicBool,
+) {
+    let mut start = [0; 16];
+    let Ok(seen) = client.peek(&mut start) else {
+        return;
+    };
+    let Ok(server) = TcpStream::connect(upstream) else {
+        return;
+    };
+    let is_socket = start[..seen].starts_with(b"GET /socket");
+    if is_socket {
+        let Ok(handle) = client.try_clone() else {
+            return;
+        };
+        sockets
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(handle);
+    }
+    let (Ok(mut client_read), Ok(mut server_read)) = (client.try_clone(), server.try_clone())
+    else {
+        return;
+    };
+    let (mut client_write, mut server_write) = (client, server);
+    let up = thread::spawn(move || {
+        let _ = std::io::copy(&mut client_read, &mut server_write);
+        let _ = server_write.shutdown(std::net::Shutdown::Both);
+    });
+    let mut buffer = [0; 16 * 1024];
+    while let Ok(read @ 1..) = server_read.read(&mut buffer) {
+        while is_socket && held.load(Ordering::SeqCst) {
+            thread::sleep(Duration::from_millis(10));
+        }
+        if client_write.write_all(&buffer[..read]).is_err() {
+            break;
+        }
+    }
+    let _ = client_write.shutdown(std::net::Shutdown::Both);
+    let _ = up.join();
+}
+
 /// A scripted second `SyncPlay` client: user `partner` on its own random device, with a
 /// WebSocket reader thread. Each instance is a separate group member.
 pub struct Partner {
@@ -322,6 +417,16 @@ impl PartnerHttp {
 
     fn post(&self, path: &str, body: &Value) {
         self.try_post(path, body).unwrap_or_else(|e| panic!("{e}"));
+    }
+
+    fn get(&self, path: &str) -> Value {
+        let url = self.base.join(path);
+        self.agent
+            .get(&url)
+            .header("Authorization", &self.auth)
+            .call()
+            .and_then(|mut response| response.body_mut().read_json())
+            .unwrap_or_else(|e| panic!("GET {url}: {e}"))
     }
 
     /// Answers a load or seek like a well-behaved client: ping, then `Ready` at `position`.
@@ -435,6 +540,34 @@ impl Partner {
     pub fn seek(&self, position: Duration) {
         self.http
             .post("/SyncPlay/Seek", &json!({"PositionTicks": ticks(position)}));
+    }
+
+    /// Reports the item loaded, for a test that has auto-`Ready` off.
+    pub fn ready(&self, pid: &str, position: Duration) {
+        let position = u64::try_from(ticks(position)).expect("ticks fit in u64");
+        self.http
+            .ready(pid, position)
+            .unwrap_or_else(|e| panic!("{e}"));
+    }
+
+    /// `GET /SyncPlay/List`, as this user sees it.
+    pub fn groups(&self) -> Vec<Value> {
+        self.http
+            .get("/SyncPlay/List")
+            .as_array()
+            .expect("group list")
+            .clone()
+    }
+
+    /// The unconsumed `SyncPlayCommand`s, oldest first, without consuming them.
+    pub fn commands(&self) -> Vec<Value> {
+        self.inbox
+            .lock()
+            .messages
+            .iter()
+            .filter(|(kind, _)| kind == "SyncPlayCommand")
+            .map(|(_, data)| data.clone())
+            .collect()
     }
 
     /// Discards every message received so far. Call it before the action whose result you
@@ -779,6 +912,8 @@ impl Player {
         match reply["error"].as_str() {
             Some("success") => reply["data"].take(),
             Some("property unavailable") => Value::Null,
+            // An unset key of user-data is "not found", not a typo.
+            Some("property not found") if property.starts_with("user-data/") => Value::Null,
             other => panic!("get {property}: {other:?}"),
         }
     }

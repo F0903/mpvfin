@@ -1,6 +1,6 @@
 //! Pure entries, commands and replies of the watch-together menu.
 
-use mpvfin_core::GroupSummary;
+use mpvfin_core::{GroupSummary, ReceiverEvent};
 use serde_json::{Value, json};
 
 /// What a menu entry does.
@@ -64,6 +64,27 @@ pub fn menu_items(groups: &[GroupSummary], current: Option<&str>) -> Vec<MenuIte
     joinable.chain([create]).chain(leave).collect()
 }
 
+/// What a choice feeds the reducer. The server keeps the viewer in the old
+/// group when a join is refused, so a join leaves it first: the two travel the
+/// same queue, and a refusal then leaves both sides agreeing the viewer is out.
+#[must_use]
+pub fn choice_events(choice: MenuChoice, grouped: bool, device_name: &str) -> Vec<ReceiverEvent> {
+    match choice {
+        MenuChoice::Join(group_id) => {
+            let join = ReceiverEvent::GroupJoin { group_id };
+            if grouped {
+                vec![ReceiverEvent::GroupLeave, join]
+            } else {
+                vec![join]
+            }
+        }
+        MenuChoice::Create => vec![ReceiverEvent::GroupCreate {
+            name: device_name.to_owned(),
+        }],
+        MenuChoice::Leave => vec![ReceiverEvent::GroupLeave],
+    }
+}
+
 /// Opens the menu in uosc; each entry's `value` is its position in `items`.
 #[must_use]
 pub fn uosc_open_command(items: &[MenuItem], client: &str) -> Vec<String> {
@@ -122,7 +143,7 @@ pub fn console_is_legacy(mpv_version: &str) -> bool {
         .strip_prefix("mpv ")
         .unwrap_or(mpv_version)
         .trim_start_matches('v');
-    let (numbers, suffix) = version.split_once('-').unwrap_or((version, ""));
+    let (numbers, suffix) = version.split_at(version.find(['-', '+']).unwrap_or(version.len()));
     let mut parts = numbers.split('.').map(str::parse::<u32>);
     let (Some(Ok(0)), Some(Ok(minor)), Some(Ok(patch))) =
         (parts.next(), parts.next(), parts.next())
@@ -131,7 +152,8 @@ pub fn console_is_legacy(mpv_version: &str) -> bool {
     };
     match minor {
         39 | 40 => true,
-        41 => patch == 0 && suffix.is_empty(),
+        // A `-dirty` tree or a distro's `+…` is still the release, not a commit past it.
+        41 => patch == 0 && (suffix.is_empty() || suffix == "-dirty" || suffix.starts_with('+')),
         _ => false,
     }
 }
@@ -178,6 +200,8 @@ fn strings(parts: &[&str]) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    use mpvfin_core::{GroupRequest, Receiver, ReceiverAction};
+
     use super::*;
 
     fn cmd(parts: &[&str]) -> Vec<String> {
@@ -343,11 +367,15 @@ mod tests {
             "mpv v0.40.0-12-gabc1234",
             "mpv v0.41.0",
             "mpv 0.41.0",
+            "mpv v0.41.0-dirty",
+            "mpv 0.40.0+dfsg",
+            "mpv 0.41.0+dfsg-1",
         ] {
             assert!(console_is_legacy(version), "{version}");
         }
         for version in [
             "mpv v0.41.0-923-g7b8915bc1",
+            "mpv v0.41.0-923-g7b8915bc1-dirty",
             "mpv v0.41.1",
             "mpv v0.42.0",
             "mpv v1.0.0",
@@ -357,6 +385,68 @@ mod tests {
         ] {
             assert!(!console_is_legacy(version), "{version}");
         }
+    }
+
+    #[test]
+    fn a_choice_feeds_its_events_and_a_join_leaves_any_current_group_first() {
+        let join = || MenuChoice::Join("b".to_owned());
+        let joined = ReceiverEvent::GroupJoin {
+            group_id: "b".to_owned(),
+        };
+        assert_eq!(choice_events(join(), false, "pc"), vec![joined.clone()]);
+        assert_eq!(
+            choice_events(join(), true, "pc"),
+            vec![ReceiverEvent::GroupLeave, joined]
+        );
+        assert_eq!(
+            choice_events(MenuChoice::Create, true, "pc"),
+            vec![ReceiverEvent::GroupCreate {
+                name: "pc".to_owned()
+            }]
+        );
+        assert_eq!(
+            choice_events(MenuChoice::Leave, true, "pc"),
+            vec![ReceiverEvent::GroupLeave]
+        );
+    }
+
+    /// The server keeps the viewer in the old group when a join is refused, so
+    /// the old group has to be left first or the two sides would disagree.
+    #[test]
+    fn a_refused_join_while_grouped_leaves_both_sides_out() {
+        let mut receiver = Receiver::new();
+        receiver.handle(ReceiverEvent::GroupJoined {
+            group_id: "a".to_owned(),
+        });
+
+        let grouped = receiver.group_id().is_some();
+        let requests: Vec<GroupRequest> =
+            choice_events(MenuChoice::Join("dead".to_owned()), grouped, "pc")
+                .into_iter()
+                .flat_map(|event| receiver.handle(event))
+                .filter_map(|action| match action {
+                    ReceiverAction::Group(request) => Some(request),
+                    _ => None,
+                })
+                .collect();
+        assert_eq!(
+            requests,
+            vec![
+                GroupRequest::Leave,
+                GroupRequest::Join {
+                    group_id: "dead".to_owned()
+                }
+            ],
+            "the server hears the leave first, on the same queue"
+        );
+        assert_eq!(receiver.group_id(), None);
+
+        let message = "That group no longer exists".to_owned();
+        let actions = receiver.handle(ReceiverEvent::GroupGone {
+            message: message.clone(),
+        });
+        assert_eq!(receiver.group_id(), None);
+        assert!(actions.contains(&ReceiverAction::ShowMessage { text: message }));
     }
 
     #[test]

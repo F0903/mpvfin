@@ -64,6 +64,8 @@ pub enum SessionEvent {
     Log(String),
     /// The answer to [`Job::ListGroups`].
     GroupList(Vec<GroupSummary>),
+    /// [`Job::ListGroups`] failed; the viewer has been told.
+    GroupListFailed,
 }
 
 /// Receives session events from the session threads; must not block.
@@ -723,6 +725,53 @@ fn listen(
     }
 }
 
+fn send_group_request(
+    request: &GroupRequest,
+    current: Option<Creds>,
+    sink: &Sink,
+    group: &Mutex<GroupState>,
+) {
+    if *request == GroupRequest::Leave {
+        locked(group).joined = None; // even if the POST fails: never rejoin
+    }
+    let result = current
+        .ok_or_else(|| "not connected".to_owned())
+        .and_then(|c| {
+            // Stamped here, not at submit: this queue can be behind.
+            let server_now_ms = local_now_ms() + locked(group).offset_ms;
+            let (path, body) = request_path_and_body(request, server_now_ms);
+            c.client.post(path, &body).map_err(|e| e.to_string())
+        });
+    if let Err(e) = result {
+        log(sink, format!("group request failed: {e}"));
+        if matches!(
+            request,
+            GroupRequest::New { .. } | GroupRequest::Join { .. }
+        ) {
+            osd(
+                sink,
+                "mpvfin: couldn't reach Jellyfin to join that group",
+                5,
+            );
+        }
+    }
+}
+
+/// Always answered, so the runtime's in-flight guard can't stick.
+fn list_groups(current: Option<Creds>, sink: &Sink) {
+    let list = current
+        .ok_or_else(|| "not connected".to_owned())
+        .and_then(|c| c.client.get("/SyncPlay/List").map_err(|e| e.to_string()));
+    match list {
+        Ok(list) => sink(SessionEvent::GroupList(parse_groups(&list))),
+        Err(e) => {
+            log(sink, format!("listing groups failed: {e}"));
+            osd(sink, "mpvfin: couldn't reach Jellyfin to list groups", 5);
+            sink(SessionEvent::GroupListFailed);
+        }
+    }
+}
+
 fn work(
     queue: &Receiver<Job>,
     sink: &Sink,
@@ -736,31 +785,8 @@ fn work(
         }
         let current = locked(creds).clone();
         match job {
-            Job::Group(request) => {
-                if request == GroupRequest::Leave {
-                    locked(group).joined = None; // even if the POST fails: never rejoin
-                }
-                let Some(c) = current else {
-                    log(sink, "group request failed: not connected".to_owned());
-                    continue;
-                };
-                // Stamped here, not at submit: this queue can be behind.
-                let server_now_ms = local_now_ms() + locked(group).offset_ms;
-                let (path, body) = request_path_and_body(&request, server_now_ms);
-                if let Err(e) = c.client.post(path, &body) {
-                    log(sink, format!("group request failed: {e}"));
-                }
-            }
-            Job::ListGroups => {
-                let Some(c) = current else {
-                    log(sink, "listing groups failed: not connected".to_owned());
-                    continue;
-                };
-                match c.client.get("/SyncPlay/List") {
-                    Ok(list) => sink(SessionEvent::GroupList(parse_groups(&list))),
-                    Err(e) => log(sink, format!("listing groups failed: {e}")),
-                }
-            }
+            Job::Group(request) => send_group_request(&request, current, sink, group),
+            Job::ListGroups => list_groups(current, sink),
             Job::Resolve {
                 generation,
                 item_id,
@@ -931,12 +957,12 @@ mod tests {
     /// Serves a group session. Each WebSocket connection sends what the test
     /// queues on `frames`, and `None` closes it. Every HTTP request is recorded
     /// on `seen` before it is answered; `/GetUtcTime` answers with the local
-    /// clock plus `offset_ms`, and `/SyncPlay/Join` fails when `join_fails`.
+    /// clock plus `offset_ms`, and requests to a path containing `failing` fail.
     fn group_server(
         seen: Sender<(String, String)>,
         frames: Receiver<Option<String>>,
         offset_ms: i64,
-        join_fails: bool,
+        failing: Option<&'static str>,
     ) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
@@ -957,7 +983,7 @@ mod tests {
                         return;
                     }
                     let (request, body) = read_request(&stream);
-                    let status = if join_fails && request.contains("/SyncPlay/Join") {
+                    let status = if failing.is_some_and(|path| request.contains(path)) {
                         "500 Internal Server Error"
                     } else {
                         "200 OK"
@@ -1083,7 +1109,7 @@ mod tests {
     fn reconnect_rejoins_the_remembered_group() {
         let (seen_tx, seen) = mpsc::channel();
         let (frames, frames_rx) = mpsc::channel();
-        let url = group_server(seen_tx, frames_rx, 0, false);
+        let url = group_server(seen_tx, frames_rx, 0, None);
         let (session, _events, dir) = connected_session(&url);
 
         frames.send(Some(group_frame("GroupJoined", "g1"))).unwrap();
@@ -1121,7 +1147,7 @@ mod tests {
         for exit in [Exit::Requested, Exit::Left, Exit::Gone] {
             let (seen_tx, seen) = mpsc::channel();
             let (frames, frames_rx) = mpsc::channel();
-            let url = group_server(seen_tx, frames_rx, 0, false);
+            let url = group_server(seen_tx, frames_rx, 0, None);
             let (session, events, dir) = connected_session(&url);
             let soon = Duration::from_secs(5);
 
@@ -1171,7 +1197,7 @@ mod tests {
     fn a_failed_rejoin_reports_the_group_gone() {
         let (seen_tx, _seen) = mpsc::channel();
         let (frames, frames_rx) = mpsc::channel();
-        let url = group_server(seen_tx, frames_rx, 0, true);
+        let url = group_server(seen_tx, frames_rx, 0, Some("/SyncPlay/Join"));
         let (session, events, dir) = connected_session(&url);
 
         frames.send(Some(group_frame("GroupJoined", "g1"))).unwrap();
@@ -1188,12 +1214,95 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
+    fn is_osd(event: &SessionEvent, wanted: &str) -> bool {
+        matches!(event, SessionEvent::Osd { text, .. } if text == wanted)
+    }
+
+    fn is_list_failed(event: &SessionEvent) -> bool {
+        matches!(event, SessionEvent::GroupListFailed)
+    }
+
+    const LIST_FAILED: &str = "mpvfin: couldn't reach Jellyfin to list groups";
+    const JOIN_FAILED: &str = "mpvfin: couldn't reach Jellyfin to join that group";
+
+    #[test]
+    fn a_failed_group_list_tells_the_viewer_and_ends_the_request() {
+        let (seen_tx, _seen) = mpsc::channel();
+        let (_frames, frames_rx) = mpsc::channel();
+        let url = group_server(seen_tx, frames_rx, 0, Some("/SyncPlay/List"));
+        let (session, events, dir) = connected_session(&url);
+        let soon = Duration::from_secs(5);
+
+        session.submit(Job::ListGroups);
+        assert!(wait_for(&events, soon, |e| is_osd(e, LIST_FAILED)));
+        assert!(wait_for(&events, soon, is_list_failed));
+
+        session.shutdown(Duration::ZERO);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn no_server_counts_as_a_failed_list_and_a_failed_join() {
+        let dir = std::env::temp_dir().join(format!("mpvfin-session-{}", new_device_id()));
+        let (tx, events) = mpsc::channel();
+        let session = start(
+            Paths {
+                config_file: dir.join("mpvfin.conf"),
+                state_file: dir.join("mpvfin-state.json"),
+            },
+            Arc::new(move |event| {
+                let _ = tx.send(event);
+            }),
+        );
+        let soon = Duration::from_secs(5);
+
+        session.submit(Job::ListGroups);
+        assert!(wait_for(&events, soon, |e| is_osd(e, LIST_FAILED)));
+        assert!(wait_for(&events, soon, is_list_failed));
+        session.submit(Job::Group(GroupRequest::Join {
+            group_id: "g".to_owned(),
+        }));
+        assert!(wait_for(&events, soon, |e| is_osd(e, JOIN_FAILED)));
+
+        session.shutdown(Duration::ZERO);
+    }
+
+    #[test]
+    fn only_a_failed_create_or_join_tells_the_viewer() {
+        let (seen_tx, _seen) = mpsc::channel();
+        let (_frames, frames_rx) = mpsc::channel();
+        let url = group_server(seen_tx, frames_rx, 0, Some("/SyncPlay/"));
+        let (session, events, dir) = connected_session(&url);
+        let soon = Duration::from_secs(5);
+
+        session.submit(Job::Group(GroupRequest::New {
+            name: "n".to_owned(),
+        }));
+        assert!(wait_for(&events, soon, |e| is_osd(e, JOIN_FAILED)));
+        session.submit(Job::Group(GroupRequest::Join {
+            group_id: "g".to_owned(),
+        }));
+        assert!(wait_for(&events, soon, |e| is_osd(e, JOIN_FAILED)));
+
+        session.submit(Job::Group(GroupRequest::Leave));
+        assert!(wait_for(&events, soon, |e| {
+            assert!(
+                !matches!(e, SessionEvent::Osd { .. }),
+                "only joining tells the viewer"
+            );
+            matches!(e, SessionEvent::Log(l) if l.contains("group request failed"))
+        }));
+
+        session.shutdown(Duration::ZERO);
+        let _ = fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn the_clock_offset_times_commands_and_ready() {
         const OFFSET_MS: i64 = 3_600_000;
         let (seen_tx, seen) = mpsc::channel();
         let (frames, frames_rx) = mpsc::channel();
-        let url = group_server(seen_tx, frames_rx, OFFSET_MS, false);
+        let url = group_server(seen_tx, frames_rx, OFFSET_MS, None);
         let (session, events, dir) = connected_session(&url);
 
         // The batch at connect gives an offset before any group, and must not Ping.

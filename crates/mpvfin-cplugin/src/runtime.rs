@@ -21,7 +21,7 @@ use crate::ffi::{
     MPV_EVENT_SHUTDOWN, MPV_EVENT_START_FILE, MPV_FORMAT_NONE, MPV_FORMAT_STRING, MpvEvent,
     MpvEventClientMessage, MpvEventEndFile, MpvEventHook, MpvEventProperty, MpvEventStartFile,
 };
-use crate::group_menu::{self, ConsoleEvent, MenuChoice, MenuItem, UoscEvent};
+use crate::group_menu::{self, ConsoleEvent, MenuItem, UoscEvent};
 use crate::mpv::{Mpv, from_c};
 use crate::skip_button::{self, CLICK_SECTION, KEY_SECTION};
 
@@ -42,10 +42,6 @@ const UOSC_MENU: &str = "user-data/uosc/menu/type";
 
 /// How long a message about the group stays on the OSD.
 const MESSAGE_DURATION: Duration = Duration::from_secs(5);
-
-/// How long a group list may be out before another press asks again: the
-/// session answers a failed request only in the log. The HTTP client's limit.
-const GROUP_LIST_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Runs the plugin until mpv shuts down; the entry point's return value.
 pub fn run(mpv: Mpv) -> c_int {
@@ -111,7 +107,7 @@ pub fn run(mpv: Mpv) -> c_int {
         drift: DriftCorrector::new(),
         drift_generation: None,
         seeking: false,
-        group_list_sent: None,
+        group_list_pending: false,
         menu_items: None,
     };
     runtime.define_skip_sections();
@@ -263,8 +259,8 @@ struct Runtime {
     drift_generation: Option<Generation>,
     /// Between `SEEK` and `PLAYBACK_RESTART`.
     seeking: bool,
-    /// When the unanswered `ListGroups` went out.
-    group_list_sent: Option<Instant>,
+    /// A `ListGroups` is out; the session answers each one, even a failure.
+    group_list_pending: bool,
     /// What the watch-together menu last offered, until a choice.
     menu_items: Option<Vec<MenuItem>>,
 }
@@ -672,12 +668,11 @@ impl Runtime {
                 }
                 SessionEvent::Osd { text, duration } => self.mpv.show_text(&text, duration),
                 SessionEvent::Log(line) => self.mpv.log(&line),
-                // No press waits on the late answer to a request that was asked again.
                 SessionEvent::GroupList(groups) => {
-                    if self.group_list_sent.take().is_some() {
-                        self.open_group_menu(&groups);
-                    }
+                    self.group_list_pending = false;
+                    self.open_group_menu(&groups);
                 }
+                SessionEvent::GroupListFailed => self.group_list_pending = false,
             }
         }
     }
@@ -710,11 +705,8 @@ impl Runtime {
 
     /// A press while a list is on its way does nothing, or two menus would open.
     fn request_group_menu(&mut self) {
-        if self
-            .group_list_sent
-            .is_none_or(|sent| sent.elapsed() >= GROUP_LIST_TIMEOUT)
-        {
-            self.group_list_sent = Some(Instant::now());
+        if !self.group_list_pending {
+            self.group_list_pending = true;
             self.session.submit(Job::ListGroups);
         }
     }
@@ -755,13 +747,11 @@ impl Runtime {
         let Some(item) = chosen.and_then(|items| items.into_iter().nth(index)) else {
             return;
         };
-        self.feed(match item.choice {
-            MenuChoice::Join(group_id) => ReceiverEvent::GroupJoin { group_id },
-            MenuChoice::Create => ReceiverEvent::GroupCreate {
-                name: mpvfin_jellyfin::device_name(),
-            },
-            MenuChoice::Leave => ReceiverEvent::GroupLeave,
-        });
+        let grouped = self.receiver.group_id().is_some();
+        let device_name = mpvfin_jellyfin::device_name();
+        for event in group_menu::choice_events(item.choice, grouped, &device_name) {
+            self.feed(event);
+        }
     }
 
     // One arm per action keeps the adapter auditable against the reducer.

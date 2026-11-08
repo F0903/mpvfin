@@ -169,6 +169,8 @@ struct Creds {
 struct GroupState {
     /// The group to rejoin after a reconnect.
     joined: Option<String>,
+    /// The server has us in a group on the current socket.
+    in_group: bool,
     /// Server clock minus local clock.
     offset_ms: i64,
 }
@@ -372,9 +374,11 @@ fn supervise(
                 Err(e) => break 'attempt format!("Jellyfin connection failed: {e}"),
             };
             log(sink, format!("connected to Jellyfin as {name}"));
-            rejoin(&client, group, sink);
+            after_connect(&client, group, sink, clock_wake);
             let connected = Instant::now();
-            let Err(e) = listen(socket, sink, stop, group, clock_wake) else {
+            let result = listen(socket, sink, stop, group, clock_wake);
+            locked(group).in_group = false;
+            let Err(e) = result else {
                 return;
             };
             if connected.elapsed() >= Duration::from_mins(1) {
@@ -388,14 +392,22 @@ fn supervise(
     }
 }
 
-/// Joins the remembered group again: the old socket's close took us out of it.
-fn rejoin(client: &Client, group: &Mutex<GroupState>, sink: &Sink) {
+/// Starts a clock batch, so the offset exists before any command, and joins the
+/// remembered group again: the old socket's close took us out of it. If that
+/// fails the group is given up, so the reducer is not left in a ghost one.
+fn after_connect(client: &Client, group: &Mutex<GroupState>, sink: &Sink, clock_wake: &Sender<()>) {
+    let _ = clock_wake.send(());
     let remembered = locked(group).joined.clone();
-    if let Some(group_id) = remembered {
-        let (path, body) = request_path_and_body(&GroupRequest::Join { group_id }, 0);
-        if let Err(e) = client.post(path, &body) {
-            log(sink, format!("rejoining the group failed: {e}"));
-        }
+    let Some(group_id) = remembered else {
+        return;
+    };
+    let (path, body) = request_path_and_body(&GroupRequest::Join { group_id }, 0);
+    if let Err(e) = client.post(path, &body) {
+        log(sink, format!("rejoining the group failed: {e}"));
+        locked(group).joined = None;
+        sink(SessionEvent::Receiver(ReceiverEvent::GroupGone {
+            message: "You are no longer in that group".to_owned(),
+        }));
     }
 }
 
@@ -585,8 +597,8 @@ fn clock_probe(client: &Client) -> Result<(i64, i64), HttpError> {
     }
 }
 
-/// Measures the clock when woken and every `CLOCK_PERIOD`, while in a group.
-/// Ends when the supervisor drops the wake sender.
+/// Measures the clock when woken (at connect and `GroupJoined`), and every
+/// `CLOCK_PERIOD` while in a group. Ends when the supervisor drops the wake sender.
 fn keep_clock(
     woken: &Receiver<()>,
     sink: &Sink,
@@ -594,12 +606,11 @@ fn keep_clock(
     creds: &Mutex<Option<Creds>>,
     group: &Mutex<GroupState>,
 ) {
-    while !matches!(
-        woken.recv_timeout(CLOCK_PERIOD),
-        Err(RecvTimeoutError::Disconnected)
-    ) {
-        if locked(group).joined.is_none() {
-            continue;
+    loop {
+        match woken.recv_timeout(CLOCK_PERIOD) {
+            Err(RecvTimeoutError::Disconnected) => return,
+            Err(RecvTimeoutError::Timeout) if !locked(group).in_group => continue,
+            _ => {}
         }
         let Some(c) = locked(creds).clone() else {
             continue;
@@ -617,10 +628,14 @@ fn keep_clock(
         let in_group = {
             let mut state = locked(group);
             state.offset_ms = offset_ms;
-            state.joined.is_some()
+            state.in_group
         };
         // The server doubles this for its start delay, so it is one-way.
-        if in_group && let Err(e) = c.client.post("/SyncPlay/Ping", &json!({ "Ping": rtt / 2 })) {
+        if in_group
+            && let Err(e) = c
+                .client
+                .post("/SyncPlay/Ping", &json!({ "Ping": (rtt / 2).max(0) }))
+        {
             log(sink, format!("group ping failed: {e}"));
         }
     }
@@ -633,22 +648,25 @@ fn on_group_update(
     group: &Mutex<GroupState>,
     clock_wake: &Sender<()>,
 ) {
+    if matches!(update, GroupUpdate::Left | GroupUpdate::Gone { .. }) {
+        let mut state = locked(group);
+        state.joined = None;
+        state.in_group = false;
+    }
     let event = match update {
         GroupUpdate::Joined { group_id } => {
-            locked(group).joined = Some(group_id.clone());
+            {
+                let mut state = locked(group);
+                state.joined = Some(group_id.clone());
+                state.in_group = true;
+            }
             let _ = clock_wake.send(());
             ReceiverEvent::GroupJoined { group_id }
         }
-        GroupUpdate::Left => {
-            locked(group).joined = None;
-            ReceiverEvent::GroupLeft
-        }
-        GroupUpdate::Gone { message } => {
-            locked(group).joined = None;
-            ReceiverEvent::GroupGone {
-                message: message.to_owned(),
-            }
-        }
+        GroupUpdate::Left => ReceiverEvent::GroupLeft,
+        GroupUpdate::Gone { message } => ReceiverEvent::GroupGone {
+            message: message.to_owned(),
+        },
         GroupUpdate::Queue(queue) => ReceiverEvent::GroupQueueChanged(queue),
         GroupUpdate::Command {
             mut command,
@@ -719,6 +737,9 @@ fn work(
         let current = locked(creds).clone();
         match job {
             Job::Group(request) => {
+                if request == GroupRequest::Leave {
+                    locked(group).joined = None; // even if the POST fails: never rejoin
+                }
                 let Some(c) = current else {
                     log(sink, "group request failed: not connected".to_owned());
                     continue;
@@ -878,9 +899,9 @@ mod tests {
         (request, String::from_utf8(body).unwrap())
     }
 
-    fn reply_json(mut stream: &TcpStream, body: &str) {
+    fn reply_json(mut stream: &TcpStream, status: &str, body: &str) {
         let reply = format!(
-            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
         );
         stream.write_all(reply.as_bytes()).unwrap();
@@ -904,16 +925,18 @@ mod tests {
         } else {
             "{}"
         };
-        reply_json(&stream, body);
+        reply_json(&stream, "200 OK", body);
     }
 
     /// Serves a group session. Each WebSocket connection sends what the test
     /// queues on `frames`, and `None` closes it. Every HTTP request is recorded
-    /// on `seen`; `/GetUtcTime` answers with the local clock plus `offset_ms`.
+    /// on `seen` before it is answered; `/GetUtcTime` answers with the local
+    /// clock plus `offset_ms`, and `/SyncPlay/Join` fails when `join_fails`.
     fn group_server(
         seen: Sender<(String, String)>,
         frames: Receiver<Option<String>>,
         offset_ms: i64,
+        join_fails: bool,
     ) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
@@ -934,6 +957,11 @@ mod tests {
                         return;
                     }
                     let (request, body) = read_request(&stream);
+                    let status = if join_fails && request.contains("/SyncPlay/Join") {
+                        "500 Internal Server Error"
+                    } else {
+                        "200 OK"
+                    };
                     let reply = if request.contains("/GetUtcTime") {
                         let now = format_utc(local_now_ms() + offset_ms);
                         format!(
@@ -942,8 +970,8 @@ mod tests {
                     } else {
                         "{}".to_owned()
                     };
-                    reply_json(&stream, &reply);
                     let _ = seen.send((request, body));
+                    reply_json(&stream, status, &reply);
                 });
             }
         });
@@ -969,10 +997,17 @@ mod tests {
         }
     }
 
-    fn group_joined_frame(group_id: &str) -> String {
-        json!({"MessageType": "SyncPlayGroupUpdate",
-               "Data": {"GroupId": group_id, "Type": "GroupJoined", "Data": {}}})
-        .to_string()
+    fn group_frame(kind: &str, group_id: &str) -> String {
+        let data = json!({"GroupId": group_id, "Type": kind, "Data": {}});
+        json!({"MessageType": "SyncPlayGroupUpdate", "Data": data}).to_string()
+    }
+
+    fn has_joined(event: &SessionEvent, wanted: &str) -> bool {
+        matches!(
+            event,
+            SessionEvent::Receiver(ReceiverEvent::GroupJoined { group_id })
+                if group_id == wanted
+        )
     }
 
     /// Waits for an event `matches` accepts; false once `timeout` has passed.
@@ -1048,22 +1083,105 @@ mod tests {
     fn reconnect_rejoins_the_remembered_group() {
         let (seen_tx, seen) = mpsc::channel();
         let (frames, frames_rx) = mpsc::channel();
-        let url = group_server(seen_tx, frames_rx, 0);
+        let url = group_server(seen_tx, frames_rx, 0, false);
         let (session, _events, dir) = connected_session(&url);
 
-        frames.send(Some(group_joined_frame("g1"))).unwrap();
+        frames.send(Some(group_frame("GroupJoined", "g1"))).unwrap();
+        requests_until(&seen, "/SyncPlay/Ping");
         frames.send(None).unwrap(); // the socket drops while in the group
 
-        let requests = requests_until(&seen, "/SyncPlay/Join");
-        let capabilities = requests
-            .iter()
-            .filter(|(line, _)| line.contains("/Sessions/Capabilities/Full"))
-            .count();
-        assert_eq!(capabilities, 2, "the rejoin must follow the capabilities");
+        // The rejoin must follow the repost, and nothing may Ping before the
+        // server has us back: that would earn a NotInGroup and a false kick.
+        requests_until(&seen, "/Sessions/Capabilities/Full");
+        let mut requests = requests_until(&seen, "/SyncPlay/Join");
         let (_, body) = requests.last().unwrap();
         assert_eq!(
             serde_json::from_str::<Value>(body).unwrap(),
             json!({"GroupId": "g1"})
+        );
+        requests.extend(std::iter::from_fn(|| {
+            seen.recv_timeout(Duration::from_millis(300)).ok()
+        }));
+        assert!(
+            !requests.iter().any(|(line, _)| line.contains("/Ping")),
+            "pinged before the server had us back"
+        );
+
+        session.shutdown(Duration::ZERO);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn left_gone_and_a_requested_leave_prevent_a_rejoin() {
+        enum Exit {
+            Left,
+            Gone,
+            Requested,
+        }
+        for exit in [Exit::Requested, Exit::Left, Exit::Gone] {
+            let (seen_tx, seen) = mpsc::channel();
+            let (frames, frames_rx) = mpsc::channel();
+            let url = group_server(seen_tx, frames_rx, 0, false);
+            let (session, events, dir) = connected_session(&url);
+            let soon = Duration::from_secs(5);
+
+            frames.send(Some(group_frame("GroupJoined", "g1"))).unwrap();
+            assert!(wait_for(&events, soon, |e| has_joined(e, "g1")));
+            match exit {
+                Exit::Left => {
+                    frames.send(Some(group_frame("GroupLeft", "g1"))).unwrap();
+                    assert!(wait_for(&events, soon, |e| matches!(
+                        e,
+                        SessionEvent::Receiver(ReceiverEvent::GroupLeft)
+                    )));
+                }
+                Exit::Gone => {
+                    frames.send(Some(group_frame("NotInGroup", "0"))).unwrap();
+                    assert!(wait_for(&events, soon, |e| matches!(
+                        e,
+                        SessionEvent::Receiver(ReceiverEvent::GroupGone { .. })
+                    )));
+                }
+                // No GroupLeft follows: the case of a Leave that never got through.
+                Exit::Requested => {
+                    session.submit(Job::Group(GroupRequest::Leave));
+                    requests_until(&seen, "/SyncPlay/Leave");
+                }
+            }
+            frames.send(None).unwrap();
+
+            let connected =
+                |e: &SessionEvent| matches!(e, SessionEvent::Log(l) if l.contains("connected"));
+            assert!(wait_for(&events, soon, connected));
+            // `listen` starts after any rejoin POST, so this ends the rejoin window.
+            frames.send(Some(group_frame("GroupJoined", "g2"))).unwrap();
+            assert!(wait_for(&events, soon, |e| has_joined(e, "g2")));
+            let joins = seen
+                .try_iter()
+                .filter(|(line, _)| line.contains("/SyncPlay/Join"))
+                .count();
+            assert_eq!(joins, 0, "rejoined a group we had left");
+
+            session.shutdown(Duration::ZERO);
+            let _ = fs::remove_dir_all(dir);
+        }
+    }
+
+    #[test]
+    fn a_failed_rejoin_reports_the_group_gone() {
+        let (seen_tx, _seen) = mpsc::channel();
+        let (frames, frames_rx) = mpsc::channel();
+        let url = group_server(seen_tx, frames_rx, 0, true);
+        let (session, events, dir) = connected_session(&url);
+
+        frames.send(Some(group_frame("GroupJoined", "g1"))).unwrap();
+        frames.send(None).unwrap();
+        assert!(
+            wait_for(&events, Duration::from_secs(5), |e| matches!(
+                e,
+                SessionEvent::Receiver(ReceiverEvent::GroupGone { .. })
+            )),
+            "a failed rejoin must not leave the reducer in a ghost group"
         );
 
         session.shutdown(Duration::ZERO);
@@ -1075,10 +1193,19 @@ mod tests {
         const OFFSET_MS: i64 = 3_600_000;
         let (seen_tx, seen) = mpsc::channel();
         let (frames, frames_rx) = mpsc::channel();
-        let url = group_server(seen_tx, frames_rx, OFFSET_MS);
+        let url = group_server(seen_tx, frames_rx, OFFSET_MS, false);
         let (session, events, dir) = connected_session(&url);
 
-        frames.send(Some(group_joined_frame("g1"))).unwrap();
+        // The batch at connect gives an offset before any group, and must not Ping.
+        for _ in 0..CLOCK_SAMPLES {
+            requests_until(&seen, "/GetUtcTime");
+        }
+        assert!(
+            seen.recv_timeout(Duration::from_millis(200)).is_err(),
+            "the connect batch sent more than its samples"
+        );
+
+        frames.send(Some(group_frame("GroupJoined", "g1"))).unwrap();
         let requests = requests_until(&seen, "/SyncPlay/Ping");
         let samples = requests
             .iter()

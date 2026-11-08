@@ -211,6 +211,17 @@ pub fn end_reason(reason: c_int, error: Option<String>) -> EndReason {
     }
 }
 
+/// Seeks to an absolute position. Exact, because with `hr-seek=no` a plain seek
+/// lands on a keyframe, possibly inside the segment being skipped.
+#[must_use]
+pub fn seek_command(position: Duration) -> Vec<String> {
+    vec![
+        "seek".to_owned(),
+        format_seconds(position),
+        "absolute+exact".to_owned(),
+    ]
+}
+
 /// Seconds with millisecond precision, as mpv's `start` option takes them.
 #[must_use]
 pub fn format_seconds(d: Duration) -> String {
@@ -442,6 +453,14 @@ mod tests {
         let selection = vec![cmd(&["set", "file-local-options/aid", "2"])];
         let mut wait = SubtitleWait::new(Generation::new(7).unwrap(), vec![], selection.clone());
         assert_eq!(wait.step(), SubtitleStep::Select(selection));
+    }
+
+    #[test]
+    fn seeks_are_exact() {
+        assert_eq!(
+            seek_command(Duration::from_millis(20_500)),
+            cmd(&["seek", "20.500", "absolute+exact"])
+        );
     }
 
     #[test]

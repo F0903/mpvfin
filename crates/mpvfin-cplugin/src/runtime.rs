@@ -622,7 +622,7 @@ impl Runtime {
             // Plain: a file-local `no` would restore a local pause when the item ends.
             ReceiverAction::SetPaused { paused: false, .. } => self.set("pause", "no"),
             ReceiverAction::Seek { position, .. } => {
-                self.run(&["seek", &adapter::format_seconds(position), "absolute"]);
+                self.run(&adapter::seek_command(position));
             }
             ReceiverAction::SetVolume { volume_percent, .. } => {
                 self.set("volume", &volume_percent.to_string());

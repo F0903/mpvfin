@@ -212,13 +212,19 @@ impl Mpv {
         self.waker.clone()
     }
 
+    /// mpv's description of an error code.
+    #[must_use]
+    pub fn error_string(&self, code: c_int) -> String {
+        // SAFETY: mpv_error_string returns a static string for any code.
+        let message = unsafe { from_c((self.error_string)(code)) };
+        message.unwrap_or_else(|| format!("error {code}"))
+    }
+
     fn check(&self, code: c_int) -> Result<(), String> {
         if code >= 0 {
             return Ok(());
         }
-        // SAFETY: mpv_error_string returns a static string for any code.
-        let message = unsafe { from_c((self.error_string)(code)) };
-        Err(message.unwrap_or_else(|| format!("error {code}")))
+        Err(self.error_string(code))
     }
 
     fn log_failure(&self, op: &str, target: &str, result: Result<(), String>) {
@@ -256,7 +262,7 @@ fn c_argv(strings: &[CString]) -> Vec<*const c_char> {
 /// # Safety
 ///
 /// `raw` must be NULL or a valid NUL-terminated string.
-unsafe fn from_c(raw: *const c_char) -> Option<String> {
+pub(crate) unsafe fn from_c(raw: *const c_char) -> Option<String> {
     if raw.is_null() {
         return None;
     }

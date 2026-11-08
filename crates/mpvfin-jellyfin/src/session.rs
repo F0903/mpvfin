@@ -547,18 +547,22 @@ fn work(queue: &Receiver<Job>, sink: &Sink, stop: &AtomicBool, creds: &Mutex<Opt
                 };
                 let resolved = matches!(event, ReceiverEvent::MediaResolved { .. });
                 sink(SessionEvent::Receiver(event));
-                // After MediaResolved, so playback never waits for segments.
-                if let (true, Some(c)) = (resolved, &current) {
-                    match c.client.get(&segments_path(&item_id)) {
-                        Ok(reply) => {
-                            let segments = parse_segments(&reply, runtime);
-                            sink(SessionEvent::Receiver(ReceiverEvent::SegmentsResolved {
-                                generation,
-                                segments,
-                            }));
+                // After MediaResolved, so playback never waits for segments; on
+                // its own thread, so a stalled reply can't delay the next resolve.
+                if let (true, Some(c)) = (resolved, current) {
+                    let s = sink.clone();
+                    spawn("segments", sink, move || {
+                        match c.client.get(&segments_path(&item_id)) {
+                            Ok(reply) => {
+                                let segments = parse_segments(&reply, runtime);
+                                s(SessionEvent::Receiver(ReceiverEvent::SegmentsResolved {
+                                    generation,
+                                    segments,
+                                }));
+                            }
+                            Err(e) => log(&s, format!("media segments unavailable: {e}")),
                         }
-                        Err(e) => log(sink, format!("media segments unavailable: {e}")),
-                    }
+                    });
                 }
             }
             Job::MarkPlayed { item_id } => {
@@ -615,6 +619,145 @@ fn resolve(c: &Creds, item_id: &str) -> Result<(ResolvedMedia, Option<i64>), Str
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::identity::new_device_id;
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::TcpListener;
+
+    /// Answers everything except `/MediaSegments`, which it never answers and
+    /// reports on `segments_asked`. Returns its URL.
+    fn segments_stalling_server(segments_asked: Sender<()>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let asked = segments_asked.clone();
+                thread::spawn(move || stub_connection(stream, &asked));
+            }
+        });
+        url
+    }
+
+    fn stub_connection(stream: TcpStream, segments_asked: &Sender<()>) {
+        let mut start = [0; 7];
+        if stream.peek(&mut start).is_ok() && &start == b"GET /so" {
+            let mut socket = tungstenite::accept(stream).unwrap();
+            while socket.read().is_ok() {}
+            return;
+        }
+        let mut reader = BufReader::new(&stream);
+        let (mut request, mut body_length) = (String::new(), 0);
+        reader.read_line(&mut request).unwrap();
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line).unwrap() == 0 || line.trim().is_empty() {
+                break;
+            }
+            if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                body_length = value.trim().parse().unwrap();
+            }
+        }
+        reader.read_exact(&mut vec![0; body_length]).unwrap();
+        if request.contains("/MediaSegments/") {
+            segments_asked.send(()).unwrap();
+            loop {
+                thread::park(); // keeps the connection open and unanswered
+            }
+        }
+        let body = if request.contains("/PlaybackInfo") {
+            r#"{"PlaySessionId":"ps","MediaSources":[{"Id":"src","SupportsDirectPlay":true}]}"#
+        } else {
+            "{}"
+        };
+        let reply = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        (&stream).write_all(reply.as_bytes()).unwrap();
+    }
+
+    /// Waits for an event `matches` accepts; false once `timeout` has passed.
+    fn wait_for(
+        events: &Receiver<SessionEvent>,
+        timeout: Duration,
+        matches: impl Fn(&SessionEvent) -> bool,
+    ) -> bool {
+        let deadline = Instant::now() + timeout;
+        while let Ok(event) =
+            events.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        {
+            if matches(&event) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn is_resolved(event: &SessionEvent, wanted: Generation) -> bool {
+        matches!(
+            event,
+            SessionEvent::Receiver(ReceiverEvent::MediaResolved { generation, .. })
+                if *generation == wanted
+        )
+    }
+
+    fn resolve_job(generation: Generation, item_id: &str) -> Job {
+        Job::Resolve {
+            generation,
+            item_id: item_id.to_owned(),
+        }
+    }
+
+    #[test]
+    fn a_stalled_segments_call_does_not_hold_up_the_next_resolve() {
+        let (asked_tx, segments_asked) = mpsc::channel();
+        let url = segments_stalling_server(asked_tx);
+        let dir = std::env::temp_dir().join(format!("mpvfin-session-{}", new_device_id()));
+        fs::create_dir_all(&dir).unwrap();
+        let paths = Paths {
+            config_file: dir.join("mpvfin.conf"),
+            state_file: dir.join("mpvfin-state.json"),
+        };
+        fs::write(&paths.config_file, format!("server={url}\n")).unwrap();
+        let state = State {
+            device_id: "device".to_owned(),
+            server: Some(BaseUrl::parse(&url).unwrap().as_str().to_owned()),
+            user_id: Some("user".to_owned()),
+            access_token: Some("token".to_owned()),
+        };
+        fs::write(&paths.state_file, serde_json::to_vec(&state).unwrap()).unwrap();
+        let (tx, events) = mpsc::channel();
+        let session = start(
+            paths,
+            Arc::new(move |event| {
+                let _ = tx.send(event);
+            }),
+        );
+        let connected =
+            |e: &SessionEvent| matches!(e, SessionEvent::Log(l) if l.contains("connected"));
+        assert!(wait_for(&events, Duration::from_secs(5), connected));
+
+        let (first, second) = (Generation::new(1).unwrap(), Generation::new(2).unwrap());
+        session.submit(resolve_job(first, "a"));
+        assert!(wait_for(&events, Duration::from_secs(5), |e| is_resolved(
+            e, first
+        )));
+        segments_asked.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        // Well inside the plugin's 4 s resolve deadline.
+        session.submit(resolve_job(second, "b"));
+        assert!(
+            wait_for(&events, Duration::from_secs(2), |e| is_resolved(e, second)),
+            "the next resolve queued behind the stalled segments call"
+        );
+
+        let started = Instant::now();
+        session.shutdown(Duration::ZERO);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "shutdown waited"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn expired_login_heads_the_quick_connect_osd() {

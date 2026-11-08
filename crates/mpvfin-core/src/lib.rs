@@ -665,10 +665,11 @@ impl Receiver {
                         EndReason::Stopped => StopReason::Stopped,
                         EndReason::Failed(_) => StopReason::Failed,
                     };
+                    let was_resolving = matches!(self.playback, PlaybackState::Resolving { .. });
                     let item_id = self.current_item_id();
                     self.terminate_current(stop, &mut actions);
-                    if let (EndReason::Failed(message), Some(item_id)) = (reason, item_id)
-                        && !matches!(actions.first(), Some(ReceiverAction::AbortLoad { .. }))
+                    if let (EndReason::Failed(message), Some(item_id), false) =
+                        (reason, item_id, was_resolving)
                     {
                         actions.push(ReceiverAction::PlaybackFailed {
                             generation,
@@ -1108,6 +1109,17 @@ mod tests {
                     generation: gen_(1)
                 }
             ]
+        );
+        assert_eq!(r.playback(), &PlaybackState::Idle);
+    }
+
+    #[test]
+    fn failed_end_while_resolving_only_aborts_hook() {
+        let mut r = Receiver::new();
+        open(&mut r, "a", 70);
+        assert_eq!(
+            r.handle(ended(gen_(1), EndReason::Failed("x".into()))),
+            vec![ReceiverAction::AbortLoad { hook_id: 70 }]
         );
         assert_eq!(r.playback(), &PlaybackState::Idle);
     }

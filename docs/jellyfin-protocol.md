@@ -109,11 +109,24 @@ verified against that image, all unauthenticated until login:
 3. `POST /Users/AuthenticateByName` `{"Username","Pw"}` with an
    `X-Emby-Authorization: MediaBrowser Client=..., Device=..., DeviceId=..., Version=...`
    header; later calls add `Token="<AccessToken>"` to that header.
-4. `GET`/`POST /System/Configuration` with `QuickConnectAvailable=true`.
+4. `GET`/`POST /System/Configuration` with `QuickConnectAvailable=true` and
+   `MinResumeDurationSeconds=0`. The default of 300 s means Jellyfin never saves
+   a resume position for the 120 s test episodes.
 5. `POST /Library/VirtualFolders?name=Shows&collectionType=tvshows&refreshLibrary=true`
    with body `{"LibraryOptions":{"PathInfos":[{"Path":"/media/shows"}]}}`.
 6. `GET /Items?Recursive=true&IncludeItemTypes=Episode` until
    `TotalRecordCount` is 3.
+
+## Behaviour observed by the end-to-end tests
+
+- A `PlayNow` for a single episode reaches the client as that episode and the
+  rest of the series. mpvfin follows the queue it was sent, so when a
+  one-episode cast ends mpv moves to the next episode.
+- With a demuxer limit too small for the file's audio and video interleave
+  (64 KiB on the test episodes), mpv logs `Too many packets in the demuxer
+  packet queues`, marks the starved stream at EOF and ends the file after a
+  seek. A plain mpv reading the server directly does the same, with no plugin
+  or proxy involved. From 512 KiB up, seeks through the proxy land every time.
 
 ## Capabilities and playback negotiation (verified against the test server)
 

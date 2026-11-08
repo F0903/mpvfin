@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/mpvfin-core",
     "crates/mpvfin-cplugin",
+    "crates/mpvfin-e2e",
     "crates/mpvfin-jellyfin",
 ]
 

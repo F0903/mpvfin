@@ -50,8 +50,9 @@ $login = Invoke-RestMethod "$base/Users/AuthenticateByName" -Method Post -Conten
 $h = @{ "X-Emby-Authorization" = "$auth, Token=`"$($login.AccessToken)`"" }
 
 $cfg = Invoke-RestMethod "$base/System/Configuration" -Headers $h
-if (-not $cfg.QuickConnectAvailable) {
+if (-not $cfg.QuickConnectAvailable -or $cfg.MinResumeDurationSeconds -ne 0) {
     $cfg.QuickConnectAvailable = $true
+    $cfg.MinResumeDurationSeconds = 0 # the default 300 s never saves a resume position on 120 s episodes
     Invoke-RestMethod "$base/System/Configuration" -Method Post -Headers $h -ContentType "application/json" -Body ($cfg | ConvertTo-Json -Depth 20) | Out-Null
 }
 

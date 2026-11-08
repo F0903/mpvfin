@@ -501,6 +501,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "mpvfin-e2e"
+version = "0.1.0"
+dependencies = [
+ "mpvfin-core",
+ "mpvfin-jellyfin",
+ "serde_json",
+ "ureq",
+]
+
+[[package]]
 name = "mpvfin-jellyfin"
 version = "0.1.0"
 dependencies = [

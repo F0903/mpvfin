@@ -177,6 +177,39 @@ impl Cast {
         assert!(position + 6.0 < target, "too close to {target}: {position}");
     }
 
+    /// Waits until both sections are off; a skip keeps them on for a moment.
+    #[track_caller]
+    fn wait_sections_off(&self) {
+        poll_until(secs(2), || {
+            (!section_active(&self.player, KEY_SECTION)
+                && !section_active(&self.player, CLICK_SECTION))
+            .then_some(())
+        });
+    }
+
+    /// Moves the pointer onto the button and waits until clicks are the button's.
+    #[track_caller]
+    fn hover_button(&self) {
+        // Under --vo=null only this makes mpv treat the pointer as hovering.
+        self.press("MOUSE_ENTER");
+        self.player.command(&["mouse", "1150", "600"]); // inside the 1280x720 button
+        self.wait_click_section(true);
+    }
+
+    #[track_caller]
+    fn wait_click_section(&self, active: bool) {
+        poll_until(T10, || {
+            (section_active(&self.player, CLICK_SECTION) == active).then_some(())
+        });
+    }
+
+    /// A left click. `keypress` has no down state, so mpv can't see a double
+    /// click in it.
+    fn click(&self) {
+        self.player.command(&["keydown", "MBTN_LEFT"]);
+        self.player.command(&["keyup", "MBTN_LEFT"]);
+    }
+
     fn press(&self, key: &str) {
         self.player.command(&["keypress", key]);
     }
@@ -646,10 +679,7 @@ fn button_appears_in_intro_and_enter_skips_it() {
     c.press("ENTER");
     c.wait_position(20.0, 24.0);
     c.wait_playing(e01);
-    assert!(
-        !section_active(&c.player, KEY_SECTION),
-        "button stayed up after the skip"
-    );
+    c.wait_sections_off();
 }
 
 #[test]
@@ -690,6 +720,43 @@ fn click_on_button_skips_and_click_elsewhere_does_not() {
     c.assert_far_from(20.0);
     c.press("MBTN_LEFT");
     c.wait_position(20.0, 24.0);
+}
+
+#[test]
+#[ignore = "needs ./scripts/test-server.ps1 -Action up"]
+fn double_enter_skips_only_once() {
+    let c = skip_cast("");
+    let e01 = c.items[0].as_str();
+    c.play_one(e01, secs(8));
+    c.wait_button();
+    c.assert_far_from(20.0);
+
+    c.press("ENTER");
+    std::thread::sleep(Duration::from_millis(80));
+    c.press("ENTER");
+    c.wait_position(20.0, 24.0);
+    c.wait_sections_off();
+    c.wait_playing(e01);
+}
+
+#[test]
+#[ignore = "needs ./scripts/test-server.ps1 -Action up"]
+fn double_click_skips_only_once_and_leaves_fullscreen_alone() {
+    let c = skip_cast("");
+    let e01 = c.items[0].as_str();
+    c.play_one(e01, secs(8));
+    c.wait_button();
+    c.hover_button();
+    c.assert_far_from(20.0);
+    let fullscreen = c.player.get("fullscreen");
+
+    c.click();
+    std::thread::sleep(Duration::from_millis(50));
+    c.click();
+    c.wait_position(20.0, 24.0);
+    c.wait_sections_off();
+    c.wait_playing(e01);
+    assert_eq!(c.player.get("fullscreen"), fullscreen);
 }
 
 #[test]

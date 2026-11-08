@@ -30,6 +30,10 @@ const TICK: Duration = Duration::from_secs(10);
 /// continues, so this bounds quitting while the server stalls.
 const RESOLVE_DEADLINE: Duration = Duration::from_secs(4);
 
+/// How long the skip input stays ours after a skip press, so the second press
+/// of a double press can't reach mpv's own bindings.
+const SKIP_LINGER: Duration = Duration::from_millis(400);
+
 /// Runs the plugin until mpv shuts down; the entry point's return value.
 pub fn run(mpv: Mpv) -> c_int {
     mpv.log("loaded");
@@ -83,6 +87,7 @@ pub fn run(mpv: Mpv) -> c_int {
         watch_later_dir,
         subtitle_wait: None,
         skip_button: None,
+        skip_sections_off_at: None,
     };
     runtime.define_skip_sections();
     runtime.event_loop();
@@ -218,6 +223,8 @@ struct Runtime {
     watch_later_dir: String,
     subtitle_wait: Option<SubtitleWait>,
     skip_button: Option<SkipButton>,
+    /// When the skip input sections go off; `None` leaves them as they are.
+    skip_sections_off_at: Option<Instant>,
 }
 
 /// The latest `ResolveMedia`, until the job thread answers it.
@@ -231,10 +238,15 @@ impl Runtime {
     fn event_loop(&mut self) {
         let mut next_tick = Instant::now() + TICK;
         loop {
-            let wake = match &self.pending_resolve {
-                Some(pending) if !pending.expired => pending.deadline.min(next_tick),
-                _ => next_tick,
-            };
+            let resolve = self
+                .pending_resolve
+                .as_ref()
+                .filter(|pending| !pending.expired)
+                .map(|pending| pending.deadline);
+            let wake = [resolve, self.skip_sections_off_at]
+                .into_iter()
+                .flatten()
+                .fold(next_tick, Instant::min);
             let timeout = wake.saturating_duration_since(Instant::now());
             let Some(event) = self.mpv.wait_event(timeout.as_secs_f64()).map(Event::read) else {
                 self.mpv.log("mpv_wait_event returned no event");
@@ -270,7 +282,11 @@ impl Runtime {
                 Event::Property(name, value) => self.property(&name, value),
                 Event::ClientMessage(args) => {
                     if skip_button::is_skip_press(&args) {
+                        let had_button = self.skip_button.is_some();
                         self.feed(ReceiverEvent::SkipRequested);
+                        if had_button && self.skip_button.is_none() {
+                            self.skip_sections_off_at = Some(Instant::now() + SKIP_LINGER);
+                        }
                     }
                 }
                 Event::CommandReply { reply_id, error } => self.sub_add_reply(reply_id, error),
@@ -279,6 +295,7 @@ impl Runtime {
             }
             self.drain();
             self.expire_resolve();
+            self.expire_skip_sections();
             if Instant::now() >= next_tick {
                 next_tick = Instant::now() + TICK;
                 self.feed(ReceiverEvent::ProgressTick);
@@ -321,6 +338,17 @@ impl Runtime {
                 generation,
                 message: "Jellyfin took too long to respond".to_owned(),
             });
+        }
+    }
+
+    fn expire_skip_sections(&mut self) {
+        if self
+            .skip_sections_off_at
+            .is_some_and(|at| Instant::now() >= at)
+        {
+            self.skip_sections_off_at = None;
+            self.run(&skip_button::set_section_command(KEY_SECTION, false));
+            self.run(&skip_button::set_section_command(CLICK_SECTION, false));
         }
     }
 
@@ -635,6 +663,10 @@ impl Runtime {
     }
 
     fn show_skip_button(&mut self, kind: SegmentKind) {
+        // A pending disable ends here; the click section must follow the pointer again.
+        if self.skip_sections_off_at.take().is_some() {
+            self.run(&skip_button::set_section_command(CLICK_SECTION, false));
+        }
         self.skip_button = Some(SkipButton {
             kind,
             hovered: false,
@@ -647,9 +679,9 @@ impl Runtime {
 
     fn hide_skip_button(&mut self) {
         self.skip_button = None;
-        self.run(&skip_button::set_section_command(KEY_SECTION, false));
-        self.run(&skip_button::set_section_command(CLICK_SECTION, false));
         self.run(&skip_button::clear_command());
+        // At once, unless the press that hid the button pushes this back.
+        self.skip_sections_off_at = Some(Instant::now());
     }
 
     fn draw_skip_button(&self) {

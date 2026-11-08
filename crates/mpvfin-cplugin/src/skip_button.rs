@@ -94,17 +94,23 @@ pub fn clear_command() -> Vec<String> {
 /// win over anything else, and is only enabled while the pointer is on the button.
 #[must_use]
 pub fn define_section_commands(client: &str) -> Vec<Vec<String>> {
-    let section = |name: &str, key: &str, flag: &str| {
+    let section = |name: &str, bindings: String, flag: &str| {
         vec![
             "define-section".to_owned(),
             name.to_owned(),
-            format!("{key} script-binding {client}/skip\n"),
+            bindings,
             flag.to_owned(),
         ]
     };
+    let skip = format!("script-binding {client}/skip");
     vec![
-        section(KEY_SECTION, "ENTER", "default"),
-        section(CLICK_SECTION, "MBTN_LEFT", "force"),
+        section(KEY_SECTION, format!("ENTER {skip}\n"), "default"),
+        // Ignored here, or a double click would also reach mpv's fullscreen binding.
+        section(
+            CLICK_SECTION,
+            format!("MBTN_LEFT {skip}\nMBTN_LEFT_DBL ignore\n"),
+            "force",
+        ),
     ]
 }
 
@@ -220,7 +226,7 @@ mod tests {
                 cmd(&[
                     "define-section",
                     "mpvfin-skip-click",
-                    "MBTN_LEFT script-binding mpvfin/skip\n",
+                    "MBTN_LEFT script-binding mpvfin/skip\nMBTN_LEFT_DBL ignore\n",
                     "force"
                 ]),
             ]

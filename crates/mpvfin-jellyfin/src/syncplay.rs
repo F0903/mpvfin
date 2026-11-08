@@ -2,15 +2,13 @@
 
 use std::time::Duration;
 
+pub use mpvfin_core::ZERO_ID;
 use mpvfin_core::{
     GroupCommand, GroupCommandKind, GroupEntry, GroupQueue, GroupRequest, GroupSummary, QueueReason,
 };
 use serde_json::{Value, json};
 
 use crate::wire::{duration_to_ticks, ticks_to_duration};
-
-/// The `PlaylistItemId` the server sends when there is no current item.
-pub const ZERO_ID: &str = "00000000000000000000000000000000";
 
 /// What a `SyncPlay` message means to the group session.
 #[derive(Clone, Debug, Eq, PartialEq)]

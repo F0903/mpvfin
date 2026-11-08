@@ -13,6 +13,11 @@ use std::fmt;
 use std::mem;
 use std::time::Duration;
 
+mod group;
+
+/// The entry id the server sends when a group has no current item.
+pub const ZERO_ID: &str = "00000000000000000000000000000000";
+
 /// Identifies one playback attempt.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct Generation(u64);
@@ -319,6 +324,8 @@ pub enum ReceiverEvent {
         token: PlayerToken,
         /// Jellyfin item identifier from the entry URL.
         item_id: String,
+        /// `SyncPlay` queue entry the URL names, if any.
+        playlist_item_id: Option<String>,
     },
     /// Jellyfin playback negotiation succeeded.
     MediaResolved {
@@ -394,6 +401,18 @@ pub enum ReceiverEvent {
     },
     /// The viewer asked to skip the active segment.
     SkipRequested,
+    /// The viewer asked to create a `SyncPlay` group.
+    GroupCreate {
+        /// Group name.
+        name: String,
+    },
+    /// The viewer asked to join a `SyncPlay` group.
+    GroupJoin {
+        /// Group id.
+        group_id: String,
+    },
+    /// The viewer asked to leave the group.
+    GroupLeave,
     /// The session joined a `SyncPlay` group.
     GroupJoined {
         /// Group id.
@@ -410,6 +429,11 @@ pub enum ReceiverEvent {
     GroupQueueChanged(GroupQueue),
     /// A group playback command arrived.
     GroupCommandReceived(GroupCommand),
+    /// The delay of a [`ReceiverAction::ScheduleResume`] elapsed.
+    GroupResumeDue {
+        /// Generation attached to the schedule.
+        generation: Generation,
+    },
     /// Periodic lifecycle-reporting tick.
     ProgressTick,
     /// Receiver shutdown.
@@ -444,6 +468,8 @@ pub enum ReceiverAction {
         media: ResolvedMedia,
         /// Stream selection for this entry.
         selection: StreamSelection,
+        /// How to load the entry for a `SyncPlay` group; `None` outside one.
+        group: Option<GroupLoadOptions>,
     },
     /// Continue the held load hook without media, failing the entry.
     AbortLoad {
@@ -541,6 +567,55 @@ pub enum ReceiverAction {
         /// Sanitized error.
         message: String,
     },
+    /// Send a request to the `SyncPlay` group.
+    Group(GroupRequest),
+    /// Replace mpv's playlist with the group's queue and start at `index`.
+    GroupLoad {
+        /// The queue in server order.
+        entries: Vec<GroupEntry>,
+        /// Entry to start.
+        index: usize,
+    },
+    /// Re-mirror the group's queue around the current entry.
+    GroupSyncPlaylist {
+        /// The queue in server order.
+        entries: Vec<GroupEntry>,
+        /// Index of the current entry.
+        index: usize,
+    },
+    /// Read mpv's playlist and send it to the group as its new queue.
+    GroupPublishQueue {
+        /// Start position of the current entry.
+        position: Duration,
+    },
+    /// Feed [`ReceiverEvent::GroupResumeDue`] after a delay.
+    ScheduleResume {
+        /// Playback generation.
+        generation: Generation,
+        /// How long to wait.
+        after: Duration,
+    },
+    /// Forget any scheduled resume.
+    CancelResume,
+    /// Start or stop correcting drift against the group's clock.
+    DriftAnchor {
+        /// Playback generation.
+        generation: Generation,
+        /// Position right now; `None` stops correcting.
+        position: Option<Duration>,
+    },
+    /// Show a message on the OSD.
+    ShowMessage {
+        /// Text to show.
+        text: String,
+    },
+}
+
+/// How to load an entry for a `SyncPlay` group.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GroupLoadOptions {
+    /// Where to start.
+    pub start: Duration,
 }
 
 /// Deterministic owner of the receiver playback state.
@@ -560,6 +635,12 @@ pub struct Receiver {
     /// Whether mpv confirmed a position for this item. Before that the position
     /// is the snapshot's zero, from before a requested start.
     position_settled: bool,
+    /// The joined `SyncPlay` group.
+    group: Option<group::Group>,
+    /// A `GroupCreate` awaits its `GroupJoined`.
+    creating_group: bool,
+    /// Queue entry of the last `PlayerOpening`; meaningless while idle.
+    opened_pid: Option<String>,
 }
 
 impl Default for Receiver {
@@ -580,6 +661,9 @@ impl Receiver {
             active: None,
             dismissed: None,
             position_settled: false,
+            group: None,
+            creating_group: false,
+            opened_pid: None,
         }
     }
 
@@ -619,8 +703,13 @@ impl Receiver {
                 actions.push(ReceiverAction::PlaylistPrevious);
             }
             ReceiverEvent::RemoteNext | ReceiverEvent::RemotePrevious => {}
-            ReceiverEvent::PlayerOpening { token, item_id } => {
+            ReceiverEvent::PlayerOpening {
+                token,
+                item_id,
+                playlist_item_id,
+            } => {
                 self.terminate_current(StopReason::Stopped, &mut actions);
+                self.opened_pid = playlist_item_id;
                 let generation = self.allocate_generation();
                 let selection = match self.pending_selection.take() {
                     Some((id, selection)) if id == item_id => selection,
@@ -658,6 +747,7 @@ impl Receiver {
                             hook_id: token.hook_id,
                             media,
                             selection,
+                            group: self.group_load_options(),
                         });
                     }
                     other => self.playback = other,
@@ -706,6 +796,7 @@ impl Receiver {
                     if seek_completed {
                         actions.push(ReceiverAction::ReportProgress(snapshot.clone()));
                         self.position_settled = true;
+                        self.group_position_settled(position, &mut actions);
                     }
                     self.evaluate_segments(&mut actions);
                 }
@@ -789,24 +880,7 @@ impl Receiver {
                     });
                 }
             }
-            ReceiverEvent::RemoteStop => match &self.playback {
-                PlaybackState::Idle => {}
-                PlaybackState::Loading { generation, .. } => {
-                    actions.push(ReceiverAction::StopPlayer {
-                        generation: *generation,
-                    });
-                }
-                PlaybackState::Playing(snapshot) => {
-                    actions.push(ReceiverAction::StopPlayer {
-                        generation: snapshot.generation,
-                    });
-                }
-                PlaybackState::Resolving { generation, .. } => {
-                    let generation = *generation;
-                    self.terminate_current(StopReason::Stopped, &mut actions);
-                    actions.push(ReceiverAction::StopPlayer { generation });
-                }
-            },
+            ReceiverEvent::RemoteStop => self.stop_player(&mut actions),
             ReceiverEvent::RemoteSetVolume(volume_percent) => {
                 if let Some(generation) = self.playing_generation() {
                     actions.push(ReceiverAction::SetVolume {
@@ -874,13 +948,21 @@ impl Receiver {
                     self.dismissed = Some(segment);
                 }
             }
-            // wired in Task 4
-            #[allow(clippy::match_same_arms)]
-            ReceiverEvent::GroupJoined { .. }
-            | ReceiverEvent::GroupLeft
-            | ReceiverEvent::GroupGone { .. }
-            | ReceiverEvent::GroupQueueChanged(_)
-            | ReceiverEvent::GroupCommandReceived(_) => {}
+            ReceiverEvent::GroupCreate { name } => self.group_create(name, &mut actions),
+            ReceiverEvent::GroupJoin { group_id } => self.group_join(group_id, &mut actions),
+            ReceiverEvent::GroupLeave => self.group_leave(&mut actions),
+            ReceiverEvent::GroupJoined { group_id } => self.group_joined(group_id, &mut actions),
+            ReceiverEvent::GroupLeft => self.drop_group(&mut actions),
+            ReceiverEvent::GroupGone { message } => self.group_gone(message, &mut actions),
+            ReceiverEvent::GroupQueueChanged(queue) => {
+                self.group_queue_changed(queue, &mut actions);
+            }
+            ReceiverEvent::GroupCommandReceived(command) => {
+                self.group_command(&command, &mut actions);
+            }
+            ReceiverEvent::GroupResumeDue { generation } => {
+                self.group_resume_due(generation, &mut actions);
+            }
             ReceiverEvent::ProgressTick => {
                 if let PlaybackState::Playing(snapshot) = &self.playback {
                     actions.push(ReceiverAction::ReportProgress(snapshot.clone()));
@@ -980,6 +1062,28 @@ impl Receiver {
                 });
             }
             self.active = next;
+        }
+    }
+
+    /// Stops mpv for whatever is current; a held hook is aborted first.
+    fn stop_player(&mut self, actions: &mut Vec<ReceiverAction>) {
+        match &self.playback {
+            PlaybackState::Idle => {}
+            PlaybackState::Loading { generation, .. } => {
+                actions.push(ReceiverAction::StopPlayer {
+                    generation: *generation,
+                });
+            }
+            PlaybackState::Playing(snapshot) => {
+                actions.push(ReceiverAction::StopPlayer {
+                    generation: snapshot.generation,
+                });
+            }
+            PlaybackState::Resolving { generation, .. } => {
+                let generation = *generation;
+                self.terminate_current(StopReason::Stopped, actions);
+                actions.push(ReceiverAction::StopPlayer { generation });
+            }
         }
     }
 
@@ -1183,11 +1287,11 @@ pub enum GroupRequest {
 mod tests {
     use super::*;
 
-    fn gen_(n: u64) -> Generation {
+    pub(super) fn gen_(n: u64) -> Generation {
         Generation::new(n).unwrap()
     }
 
-    fn token(entry_id: i64, hook_id: u64) -> PlayerToken {
+    pub(super) fn token(entry_id: i64, hook_id: u64) -> PlayerToken {
         PlayerToken { entry_id, hook_id }
     }
 
@@ -1219,21 +1323,22 @@ mod tests {
         }
     }
 
-    fn open(r: &mut Receiver, item: &str, hook: u64) -> Vec<ReceiverAction> {
+    pub(super) fn open(r: &mut Receiver, item: &str, hook: u64) -> Vec<ReceiverAction> {
         r.handle(ReceiverEvent::PlayerOpening {
             token: token(1, hook),
             item_id: item.to_owned(),
+            playlist_item_id: None,
         })
     }
 
-    fn resolve(r: &mut Receiver, g: Generation, item: &str) -> Vec<ReceiverAction> {
+    pub(super) fn resolve(r: &mut Receiver, g: Generation, item: &str) -> Vec<ReceiverAction> {
         r.handle(ReceiverEvent::MediaResolved {
             generation: g,
             media: media(item),
         })
     }
 
-    fn begin_playing(r: &mut Receiver, item: &str, hook: u64) -> Generation {
+    pub(super) fn begin_playing(r: &mut Receiver, item: &str, hook: u64) -> Generation {
         let g = match open(r, item, hook).as_slice() {
             [ReceiverAction::ResolveMedia { generation, .. }] => *generation,
             other => panic!("unexpected actions: {other:?}"),
@@ -1250,7 +1355,7 @@ mod tests {
         g
     }
 
-    fn ended(g: Generation, reason: EndReason) -> ReceiverEvent {
+    pub(super) fn ended(g: Generation, reason: EndReason) -> ReceiverEvent {
         ReceiverEvent::PlayerEnded {
             generation: g,
             reason,
@@ -1721,7 +1826,7 @@ mod tests {
     }
 
     /// mpv's first confirmed position for the item, which opens the button.
-    fn settle(r: &mut Receiver, g: Generation, secs: u64) -> Vec<ReceiverAction> {
+    pub(super) fn settle(r: &mut Receiver, g: Generation, secs: u64) -> Vec<ReceiverAction> {
         r.handle(ReceiverEvent::PlayerPositionChanged {
             generation: g,
             position: Duration::from_secs(secs),

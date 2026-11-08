@@ -367,6 +367,7 @@ impl Runtime {
             (Some(entry_id), Some(item_id)) => self.feed(ReceiverEvent::PlayerOpening {
                 token: PlayerToken { entry_id, hook_id },
                 item_id: item_id.to_owned(),
+                playlist_item_id: None, // wired in Task 7
             }),
             // Not an mpvfin entry: mpv must not wait for us.
             _ => self.mpv.hook_continue(hook_id),
@@ -553,6 +554,8 @@ impl Runtime {
         }
     }
 
+    // One arm per action keeps the adapter auditable against the reducer.
+    #[allow(clippy::too_many_lines)]
     fn execute(&mut self, action: ReceiverAction) {
         match action {
             ReceiverAction::QueueItems(request) => {
@@ -587,6 +590,7 @@ impl Runtime {
                 hook_id,
                 media,
                 selection,
+                group: _, // wired in Task 7
             } => {
                 for (name, value) in adapter::hook_properties(&media, &self.watch_later_dir) {
                     self.set(name, &value);
@@ -647,6 +651,15 @@ impl Runtime {
                 self.mpv
                     .show_text(&format!("mpvfin: {message}"), Duration::from_secs(5));
             }
+            // wired in Task 7
+            ReceiverAction::Group(_)
+            | ReceiverAction::GroupLoad { .. }
+            | ReceiverAction::GroupSyncPlaylist { .. }
+            | ReceiverAction::GroupPublishQueue { .. }
+            | ReceiverAction::ScheduleResume { .. }
+            | ReceiverAction::CancelResume
+            | ReceiverAction::DriftAnchor { .. }
+            | ReceiverAction::ShowMessage { .. } => {}
         }
     }
 

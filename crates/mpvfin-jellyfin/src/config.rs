@@ -27,7 +27,9 @@ pub fn parse_config(text: &str) -> Result<Config, String> {
         .find(|(k, _)| k.trim() == "server")
         .map(|(_, v)| v.trim())
         .ok_or("mpvfin.conf: missing `server`")?;
-    Ok(Config { server: BaseUrl::parse(server).map_err(|e| format!("server: {e}"))? })
+    Ok(Config {
+        server: BaseUrl::parse(server).map_err(|e| format!("server: {e}"))?,
+    })
 }
 
 /// Scheme, host and optional path prefix, without a trailing slash.
@@ -111,7 +113,13 @@ mod tests {
     fn websocket_url_maps_scheme_and_keeps_prefix() {
         let t = Secret::new("t".into());
         let w = |u: &str| BaseUrl::parse(u).unwrap().websocket(&t, "d");
-        assert_eq!(w("http://h:8096").expose(), "ws://h:8096/socket?ApiKey=t&deviceId=d");
-        assert_eq!(w("https://h/jf").expose(), "wss://h/jf/socket?ApiKey=t&deviceId=d");
+        assert_eq!(
+            w("http://h:8096").expose(),
+            "ws://h:8096/socket?ApiKey=t&deviceId=d"
+        );
+        assert_eq!(
+            w("https://h/jf").expose(),
+            "wss://h/jf/socket?ApiKey=t&deviceId=d"
+        );
     }
 }

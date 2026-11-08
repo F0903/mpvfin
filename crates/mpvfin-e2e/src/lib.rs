@@ -250,7 +250,8 @@ fn stub_connection(stream: TcpStream, item: &str, requested: &AtomicBool) {
     };
     if start[..seen].starts_with(b"GET /socket") {
         let mut socket = tungstenite::accept(stream).expect("stub WebSocket handshake");
-        let play = json!({"MessageType": "Play", "Data": {"ItemIds": [item], "PlayCommand": "PlayNow"}});
+        let play =
+            json!({"MessageType": "Play", "Data": {"ItemIds": [item], "PlayCommand": "PlayNow"}});
         socket
             .send(tungstenite::Message::text(play.to_string()))
             .expect("stub Play message");
@@ -277,10 +278,12 @@ fn stub_connection(stream: TcpStream, item: &str, requested: &AtomicBool) {
             thread::park(); // keeps the connection open and unanswered
         }
     }
-    let _ = (&stream).write_all(b"HTTP/1.1 204 No Content
+    let _ = (&stream).write_all(
+        b"HTTP/1.1 204 No Content
 Connection: close
 
-");
+",
+    );
 }
 
 fn header(device_id: &str, token: Option<&str>) -> String {

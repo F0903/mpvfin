@@ -68,7 +68,10 @@ impl StateFile {
     /// Reads the state; a missing or corrupt file yields a fresh one.
     pub fn load(&mut self) -> State {
         let mut text = String::new();
-        let read = self.0.seek(SeekFrom::Start(0)).and_then(|_| self.0.read_to_string(&mut text));
+        let read = self
+            .0
+            .seek(SeekFrom::Start(0))
+            .and_then(|_| self.0.read_to_string(&mut text));
         read.ok()
             .and_then(|_| serde_json::from_str(&text).ok())
             .unwrap_or_else(|| State {

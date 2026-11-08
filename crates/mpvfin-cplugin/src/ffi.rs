@@ -124,8 +124,7 @@ pub type MpvWaitEventFn = unsafe extern "C" fn(*mut MpvHandle, f64) -> *mut MpvE
 pub type MpvWakeupFn = unsafe extern "C" fn(*mut MpvHandle);
 pub type MpvCommandFn = unsafe extern "C" fn(*mut MpvHandle, *mut *const c_char) -> c_int;
 pub type MpvCommandStringFn = unsafe extern "C" fn(*mut MpvHandle, *const c_char) -> c_int;
-pub type MpvCommandAsyncFn =
-    unsafe extern "C" fn(*mut MpvHandle, u64, *mut *const c_char) -> c_int;
+pub type MpvCommandAsyncFn = unsafe extern "C" fn(*mut MpvHandle, u64, *mut *const c_char) -> c_int;
 pub type MpvCommandRetFn =
     unsafe extern "C" fn(*mut MpvHandle, *mut *const c_char, *mut MpvNode) -> c_int;
 pub type MpvFreeNodeContentsFn = unsafe extern "C" fn(*mut MpvNode);

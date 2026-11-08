@@ -68,12 +68,18 @@ mod tests {
     #[test]
     fn auth_header_percent_encodes_values() {
         let h = auth_header("Living \"Room\", PC", "id", None);
-        assert!(h.expose().contains("Device=\"Living%20%22Room%22%2C%20PC\""));
+        assert!(
+            h.expose()
+                .contains("Device=\"Living%20%22Room%22%2C%20PC\"")
+        );
         assert!(!h.expose().contains("Token"));
         let t = Secret::new("tok".into());
         let h = auth_header("n", "id", Some(&t));
         assert!(h.expose().ends_with(", Token=\"tok\""));
-        assert!(h.expose().starts_with("MediaBrowser Client=\"mpvfin\", Device=\"n\""));
+        assert!(
+            h.expose()
+                .starts_with("MediaBrowser Client=\"mpvfin\", Device=\"n\"")
+        );
     }
 
     #[test]

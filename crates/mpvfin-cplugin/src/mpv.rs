@@ -9,8 +9,7 @@ use std::time::Duration;
 
 use crate::ffi::{
     self, MPV_EVENT_HOOK, MPV_FORMAT_NONE, MPV_FORMAT_STRING, MpvCommandAsyncFn, MpvCommandFn,
-    MpvCommandRetFn,
-    MpvErrorStringFn, MpvEvent, MpvEventHook, MpvFreeFn, MpvFreeNodeContentsFn,
+    MpvCommandRetFn, MpvErrorStringFn, MpvEvent, MpvEventHook, MpvFreeFn, MpvFreeNodeContentsFn,
     MpvGetPropertyStringFn, MpvHandle, MpvHookAddFn, MpvHookContinueFn, MpvNode, MpvNodeValue,
     MpvObservePropertyFn, MpvSetPropertyStringFn, MpvWaitEventFn, MpvWakeupFn,
 };

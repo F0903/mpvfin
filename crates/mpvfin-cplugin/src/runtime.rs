@@ -13,11 +13,12 @@ use mpvfin_core::{
 };
 use mpvfin_jellyfin::{Job, Paths, Report, SessionEvent, SessionHandle};
 
-use crate::adapter::{self, TrackKind};
+use crate::adapter::{self, SubtitleWait, TrackKind};
 use crate::ffi::{
-    MPV_EVENT_END_FILE, MPV_EVENT_FILE_LOADED, MPV_EVENT_HOOK, MPV_EVENT_PLAYBACK_RESTART,
-    MPV_EVENT_PROPERTY_CHANGE, MPV_EVENT_SHUTDOWN, MPV_EVENT_START_FILE, MPV_FORMAT_STRING,
-    MpvEvent, MpvEventEndFile, MpvEventHook, MpvEventProperty, MpvEventStartFile,
+    MPV_EVENT_COMMAND_REPLY, MPV_EVENT_END_FILE, MPV_EVENT_FILE_LOADED, MPV_EVENT_HOOK,
+    MPV_EVENT_PLAYBACK_RESTART, MPV_EVENT_PROPERTY_CHANGE, MPV_EVENT_SHUTDOWN,
+    MPV_EVENT_START_FILE, MPV_FORMAT_STRING, MpvEvent, MpvEventEndFile, MpvEventHook,
+    MpvEventProperty, MpvEventStartFile,
 };
 use crate::mpv::{Mpv, from_c};
 
@@ -68,6 +69,7 @@ pub fn run(mpv: Mpv) -> c_int {
         observed: Observed::default(),
         pending_resolve: None,
         watch_later_dir,
+        subtitle_wait: None,
     };
     runtime.event_loop();
     runtime.shutdown()
@@ -85,6 +87,10 @@ enum Event {
     },
     Restart,
     Property(String, Option<String>),
+    CommandReply {
+        reply_id: u64,
+        error: c_int,
+    },
     Shutdown,
     /// A wakeup, a timeout, or an event the runtime does not use.
     Other,
@@ -130,6 +136,10 @@ impl Event {
                         Some(Self::Property(from_c(p.name)?, value))
                     })
                     .unwrap_or(Self::Other),
+                MPV_EVENT_COMMAND_REPLY => Self::CommandReply {
+                    reply_id: event.reply_userdata,
+                    error: event.error,
+                },
                 MPV_EVENT_SHUTDOWN => Self::Shutdown,
                 _ => Self::Other,
             }
@@ -167,6 +177,7 @@ struct Runtime {
     observed: Observed,
     pending_resolve: Option<PendingResolve>,
     watch_later_dir: String,
+    subtitle_wait: Option<SubtitleWait>,
 }
 
 /// The latest `ResolveMedia`, until the job thread answers it.
@@ -217,6 +228,7 @@ impl Runtime {
                     }
                 }
                 Event::Property(name, value) => self.property(&name, value),
+                Event::CommandReply { reply_id, error } => self.sub_add_reply(reply_id, error),
                 Event::Shutdown => return,
                 Event::Other => {}
             }
@@ -286,18 +298,67 @@ impl Runtime {
             return;
         };
         let generation = entry.generation;
-        let commands = entry
+        let (sub_adds, selection) = entry
             .media
             .as_ref()
-            .map(|(media, selection)| adapter::after_load_commands(media, selection))
+            .map(|(media, selection)| {
+                (
+                    adapter::sub_add_commands(media),
+                    adapter::selection_commands(media, selection),
+                )
+            })
             .unwrap_or_default();
         self.feed(ReceiverEvent::PlayerFileLoaded { generation });
-        for command in commands {
-            self.run(&command);
-        }
+        self.add_subtitles(generation, &sub_adds, selection);
         for name in ["pause", "volume", "mute", "aid"] {
             if let Some(event) = self.player_event(generation, name) {
                 self.feed(event);
+            }
+        }
+    }
+
+    /// Starts the `sub-add`s off the plugin thread (a stalled subtitle must not
+    /// freeze it); the selection runs once the last one has finished.
+    fn add_subtitles(
+        &mut self,
+        generation: Generation,
+        sub_adds: &[Vec<String>],
+        selection: Vec<Vec<String>>,
+    ) {
+        let mut issued = 0;
+        for command in sub_adds {
+            let args: Vec<&str> = command.iter().map(String::as_str).collect();
+            match self.mpv.command_async(generation.get(), &args) {
+                Ok(()) => issued += 1,
+                Err(e) => self.mpv.log(&e),
+            }
+        }
+        if issued == 0 {
+            for command in selection {
+                self.run(&command);
+            }
+        } else {
+            self.subtitle_wait = Some(SubtitleWait::new(generation, issued, selection));
+        }
+    }
+
+    fn sub_add_reply(&mut self, reply_id: u64, error: c_int) {
+        if error < 0 {
+            self.mpv
+                .log(&format!("sub-add: {}", self.mpv.error_string(error)));
+        }
+        let current = self.current_generation();
+        let Some(wait) = self
+            .subtitle_wait
+            .as_mut()
+            .filter(|wait| Some(wait.generation()) == current)
+        else {
+            return;
+        };
+        if let Some(selection) = wait.reply(reply_id) {
+            self.subtitle_wait = None;
+            for command in selection {
+                self.run(&command);
             }
         }
     }

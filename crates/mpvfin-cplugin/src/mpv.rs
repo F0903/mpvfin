@@ -8,7 +8,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use crate::ffi::{
-    self, MPV_EVENT_HOOK, MPV_FORMAT_NONE, MPV_FORMAT_STRING, MpvCommandFn, MpvCommandRetFn,
+    self, MPV_EVENT_HOOK, MPV_FORMAT_NONE, MPV_FORMAT_STRING, MpvCommandAsyncFn, MpvCommandFn,
+    MpvCommandRetFn,
     MpvErrorStringFn, MpvEvent, MpvEventHook, MpvFreeFn, MpvFreeNodeContentsFn,
     MpvGetPropertyStringFn, MpvHandle, MpvHookAddFn, MpvHookContinueFn, MpvNode, MpvNodeValue,
     MpvObservePropertyFn, MpvSetPropertyStringFn, MpvWaitEventFn, MpvWakeupFn,
@@ -22,6 +23,7 @@ pub struct Mpv {
     handle: *mut MpvHandle,
     wait_event: MpvWaitEventFn,
     command: MpvCommandFn,
+    command_async: MpvCommandAsyncFn,
     command_ret: MpvCommandRetFn,
     free_node_contents: MpvFreeNodeContentsFn,
     set_property_string: MpvSetPropertyStringFn,
@@ -52,6 +54,7 @@ impl Mpv {
                 handle,
                 wait_event: ffi::pfn_mpv_wait_event?,
                 command: ffi::pfn_mpv_command?,
+                command_async: ffi::pfn_mpv_command_async?,
                 command_ret: ffi::pfn_mpv_command_ret?,
                 free_node_contents: ffi::pfn_mpv_free_node_contents?,
                 set_property_string: ffi::pfn_mpv_set_property_string?,
@@ -96,6 +99,21 @@ impl Mpv {
         // SAFETY: `ptrs` is a NULL-terminated array of NUL-terminated strings
         // that outlive the call.
         let code = unsafe { (self.command)(self.handle, ptrs.as_mut_ptr()) };
+        self.check(code).map_err(|e| format!("{name}: {e}"))
+    }
+
+    /// Queues a command; `MPV_EVENT_COMMAND_REPLY` carries `reply_id` and its
+    /// outcome.
+    ///
+    /// # Errors
+    ///
+    /// Names the command and why mpv rejected it; no reply follows.
+    pub fn command_async(&self, reply_id: u64, args: &[&str]) -> Result<(), String> {
+        let name = args.first().copied().unwrap_or_default();
+        let strings = c_strings(args).map_err(|e| format!("{name}: {e}"))?;
+        let mut ptrs = c_argv(&strings);
+        // SAFETY: as in `command`; mpv copies the arguments before returning.
+        let code = unsafe { (self.command_async)(self.handle, reply_id, ptrs.as_mut_ptr()) };
         self.check(code).map_err(|e| format!("{name}: {e}"))
     }
 

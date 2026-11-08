@@ -3,7 +3,7 @@
 use std::ffi::c_int;
 use std::time::Duration;
 
-use mpvfin_core::{EndReason, QueueMode, QueueRequest, ResolvedMedia, StreamSelection};
+use mpvfin_core::{EndReason, Generation, QueueMode, QueueRequest, ResolvedMedia, StreamSelection};
 
 use crate::ffi::{MPV_END_FILE_REASON_EOF, MPV_END_FILE_REASON_ERROR};
 
@@ -100,20 +100,65 @@ pub fn hook_properties(
     ]
 }
 
-/// Commands run once the file loaded: external subtitles, then the selection.
+/// `sub-add` commands for the external subtitles, in track order.
 #[must_use]
-pub fn after_load_commands(media: &ResolvedMedia, selection: &StreamSelection) -> Vec<Vec<String>> {
-    let subtitles = media
+pub fn sub_add_commands(media: &ResolvedMedia) -> Vec<Vec<String>> {
+    media
         .external_subtitles
         .iter()
-        .map(|url| vec!["sub-add".to_owned(), url.clone(), "auto".to_owned()]);
+        .map(|url| vec!["sub-add".to_owned(), url.clone(), "auto".to_owned()])
+        .collect()
+}
+
+/// Commands applying the selection; they run after the `sub-add` commands.
+#[must_use]
+pub fn selection_commands(media: &ResolvedMedia, selection: &StreamSelection) -> Vec<Vec<String>> {
     let audio = selection
         .audio
         .and_then(|index| track_command(media, TrackKind::Audio, index));
     let subtitle = selection
         .subtitle
         .and_then(|index| track_command(media, TrackKind::Subtitle, index));
-    subtitles.chain(audio).chain(subtitle).collect()
+    audio.into_iter().chain(subtitle).collect()
+}
+
+/// Asynchronous `sub-add`s still running for a generation; the selection
+/// waits for them because it may name one of their tracks.
+pub struct SubtitleWait {
+    generation: Generation,
+    remaining: usize,
+    selection: Vec<Vec<String>>,
+}
+
+impl SubtitleWait {
+    /// Waits for `remaining` replies carrying `generation` as their reply id.
+    #[must_use]
+    pub const fn new(
+        generation: Generation,
+        remaining: usize,
+        selection: Vec<Vec<String>>,
+    ) -> Self {
+        Self {
+            generation,
+            remaining,
+            selection,
+        }
+    }
+
+    /// The generation these `sub-add`s belong to.
+    #[must_use]
+    pub const fn generation(&self) -> Generation {
+        self.generation
+    }
+
+    /// Counts one reply; returns the selection when it was the last.
+    pub fn reply(&mut self, reply_id: u64) -> Option<Vec<Vec<String>>> {
+        if reply_id != self.generation.get() || self.remaining == 0 {
+            return None;
+        }
+        self.remaining -= 1;
+        (self.remaining == 0).then(|| std::mem::take(&mut self.selection))
+    }
 }
 
 /// Selects the mpv track for a Jellyfin stream index; subtitle `-1` is off.
@@ -163,7 +208,7 @@ mod tests {
     use crate::ffi::{
         MPV_END_FILE_REASON_QUIT, MPV_END_FILE_REASON_REDIRECT, MPV_END_FILE_REASON_STOP,
     };
-    use mpvfin_core::{PlayMethod, TrackMap};
+    use mpvfin_core::{Generation, PlayMethod, TrackMap};
 
     fn cmd(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|s| (*s).to_owned()).collect()
@@ -328,21 +373,23 @@ mod tests {
     }
 
     #[test]
-    fn after_load_adds_external_subs_then_applies_selection() {
+    fn sub_adds_are_split_from_the_selection() {
         let m = media();
-        let sub_add = cmd(&[
-            "sub-add",
-            "https://jf.invalid/abc/Subtitles/0/Stream.srt",
-            "auto",
-        ]);
+        assert_eq!(
+            sub_add_commands(&m),
+            vec![cmd(&[
+                "sub-add",
+                "https://jf.invalid/abc/Subtitles/0/Stream.srt",
+                "auto",
+            ])]
+        );
         let selection = StreamSelection {
             audio: Some(2),
             subtitle: Some(5),
         };
         assert_eq!(
-            after_load_commands(&m, &selection),
+            selection_commands(&m, &selection),
             vec![
-                sub_add.clone(),
                 cmd(&["set", "file-local-options/aid", "2"]),
                 cmd(&["set", "file-local-options/sid", "3"]),
             ]
@@ -352,9 +399,20 @@ mod tests {
             subtitle: Some(-1),
         };
         assert_eq!(
-            after_load_commands(&m, &off),
-            vec![sub_add, cmd(&["set", "file-local-options/sid", "no"])]
+            selection_commands(&m, &off),
+            vec![cmd(&["set", "file-local-options/sid", "no"])]
         );
+    }
+
+    #[test]
+    fn selection_is_released_once_by_the_last_reply_of_its_generation() {
+        let generation = Generation::new(7).unwrap();
+        let selection = vec![cmd(&["set", "file-local-options/sid", "3"])];
+        let mut wait = SubtitleWait::new(generation, 2, selection.clone());
+        assert_eq!(wait.reply(6), None, "another generation's reply");
+        assert_eq!(wait.reply(7), None, "one of two");
+        assert_eq!(wait.reply(7), Some(selection));
+        assert_eq!(wait.reply(7), None, "already released");
     }
 
     #[test]

@@ -68,9 +68,11 @@ so mpv's own playlist is the queue and the user's next/previous keys work.
    under the state file) file-locally, then continues the hook, so mpv records
    no resume data for Jellyfin items, not even on `quit-watch-later`. Every
    hook is continued exactly once; `Mpv` rejects unknown or repeated ids.
-5. On `file-loaded` the plugin adds external subtitles and applies the
-   selected tracks, then reports start. Pause, seek, volume, mute and track
-   changes are reported once mpv confirms them, whoever made them.
+5. On `file-loaded` the plugin reports start, then adds external subtitles
+   with `mpv_command_async`, so a stalled subtitle cannot freeze the event
+   loop, and applies the selected tracks once the last `sub-add` has replied.
+   Pause, seek, volume, mute and track changes are reported once mpv confirms
+   them, whoever made them.
 6. `end-file` or a replacing cast reports stop exactly once, and only for an
    item whose start was reported.
 

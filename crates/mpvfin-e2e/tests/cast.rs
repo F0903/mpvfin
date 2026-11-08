@@ -314,6 +314,22 @@ fn remote_track_changes_select_mpv_tracks() {
 
 #[test]
 #[ignore = "needs ./scripts/test-server.ps1 -Action up"]
+fn cast_selecting_an_external_subtitle_applies_after_its_sub_add() {
+    let c = cast();
+    let (_, external_sub) = c.e01_streams();
+    c.server
+        .play_with_subtitle(&c.session, &c.items[0], external_sub);
+    poll_until(T20, || {
+        let tracks = c.player.get("track-list");
+        tracks.as_array()?.iter().find(|t| {
+            t["type"] == "sub" && t["id"] == 3 && t["external"] == true && t["selected"] == true
+        })?;
+        Some(())
+    });
+}
+
+#[test]
+#[ignore = "needs ./scripts/test-server.ps1 -Action up"]
 fn config_dir_untouched_and_token_absent_from_log() {
     let mpv_conf = "save-position-on-quit=yes\nwatch-later-dir=~~/watch_later\n";
     let server = Server::connect();

@@ -138,6 +138,16 @@ impl Server {
         );
     }
 
+    /// Tells `session` to play `item` now with a subtitle stream selected.
+    pub fn play_with_subtitle(&self, session: &str, item: &str, subtitle_index: i64) {
+        self.post(
+            &format!(
+                "/Sessions/{session}/Playing?playCommand=PlayNow&itemIds={item}&subtitleStreamIndex={subtitle_index}"
+            ),
+            &json!({}),
+        );
+    }
+
     /// Sends a playstate command, e.g. `Pause` or `Seek`.
     pub fn playstate(&self, session: &str, command: &str, seek: Option<Duration>) {
         let query = seek.map_or(String::new(), |d| {

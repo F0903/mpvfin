@@ -222,9 +222,9 @@ sets this up without a reset.
   patterns. These names matched unchanged: `Intro` (Intro), `Recap` (Recap),
   `Credits` (Outro), `Preview` (Preview); `Cold Open` and `Part 1` produce
   nothing. Test chapters (E01: Cold Open 0-5, Intro 5-20, Part 1 20-100,
-  Credits 100-120; E02: Recap 0-10, Part 1 10-90, Credits 90-110, Preview
-  110-120) are remuxed in place with `ffmpeg -map 0 -map_chapters 1 -c copy`;
-  marker file `/media/.chapters-v1`. A segment that runs to the last chapter
+  Credits 100-120; E02: Recap 0-10, Part 1 10-50, Credits 50-70, Part 2
+  70-110, Preview 110-120, so that credits end before the 90% watched point) are remuxed in place with `ffmpeg -map 0 -map_chapters 1 -c copy`;
+  marker file `/media/.chapters-v2`. A segment that runs to the last chapter
   ends at the file end (`EndTicks` about 120.047 s, not exactly 120).
 - Scan: scheduled task key `TaskExtractMediaSegments` ("Media Segment Scan");
   `POST /ScheduledTasks/Running/{taskId}` starts it, `GET /ScheduledTasks/{taskId}`
@@ -250,6 +250,5 @@ segment ending within 5 s of the runtime as running to the end of the file.
 A `PlayNow` for a single episode arrives with the rest of the series queued
 behind it: casting E02 alone gives the plugin `[E02, E03]` (seen as two
 `loadfile` commands; mpvfin adds nothing to the queue). Skipping to the end of
-E02 therefore plays E03 instead of leaving mpv idle, and the
-`skipping_credits_mid_file_lands_on_the_preview` test asserts only that E02
-ends, which is what the plan requires.
+E02 therefore plays E03 instead of leaving mpv idle, which
+`skipping_the_preview_at_end_of_file_ends_the_item` asserts.

@@ -50,14 +50,15 @@
 | E01 | `Part 1` | 20–100 | none |
 | E01 | `Credits` | 100–120 | Outro (to end of file) |
 | E02 | `Recap` | 0–10 | Recap |
-| E02 | `Part 1` | 10–90 | none |
-| E02 | `Credits` | 90–110 | Outro |
+| E02 | `Part 1` | 10–50 | none |
+| E02 | `Credits` | 50–70 | Outro |
+| E02 | `Part 2` | 70–110 | none |
 | E02 | `Preview` | 110–120 | Preview (to end of file) |
 | E03 | none | | none |
 
 - [ ] **Step 1: Extend `up`, idempotently and without a reset**
   1. Install `Chapter Segments Provider` (assembly GUID `698b6f3314ca49b59d79fc3c0ab941f5`, version `4.0.0.0`) through `POST /Packages/Installed/{name}` if `GET /Plugins` doesn't list it, then restart the container and wait for the server.
-  2. If the marker `/media/.chapters-v1` is missing, regenerate E01 and E02 in place with chapters from ffmetadata, keeping every existing stream, then create the marker and run a library refresh. Keep the file names, so the item IDs and existing tests are unaffected as far as Jellyfin allows.
+  2. If the marker `/media/.chapters-v2` is missing, regenerate E01 and E02 in place with chapters from ffmetadata, keeping every existing stream, then create the marker and run a library refresh. Keep the file names, so the item IDs and existing tests are unaffected as far as Jellyfin allows.
   3. Run the `TaskExtractMediaSegments` scheduled task (`/ScheduledTasks`, then `/ScheduledTasks/Running/{id}`) and poll until E01 and E02 return their segments.
   4. Finish by checking the table above against `GET /MediaSegments/{itemId}`, and throw if it differs. Keep the existing final line, `Test server ready: 3 episodes`.
 

@@ -541,6 +541,9 @@ pub struct Receiver {
     active: Option<Segment>,
     /// Segment the viewer skipped, hidden until the position leaves it.
     dismissed: Option<Segment>,
+    /// Whether mpv confirmed a position for this item. Before that the position
+    /// is the snapshot's zero, from before a requested start.
+    position_settled: bool,
 }
 
 impl Default for Receiver {
@@ -560,6 +563,7 @@ impl Receiver {
             segments: Vec::new(),
             active: None,
             dismissed: None,
+            position_settled: false,
         }
     }
 
@@ -671,6 +675,7 @@ impl Receiver {
                 } if expected == generation => {
                     let snapshot = Self::initial_snapshot(generation, &media);
                     self.playback = PlaybackState::Playing(snapshot.clone());
+                    self.position_settled = false;
                     actions.push(ReceiverAction::ReportStarted(snapshot));
                 }
                 other => self.playback = other,
@@ -684,6 +689,7 @@ impl Receiver {
                     snapshot.position = position;
                     if seek_completed {
                         actions.push(ReceiverAction::ReportProgress(snapshot.clone()));
+                        self.position_settled = true;
                     }
                     self.evaluate_segments(&mut actions);
                 }
@@ -927,6 +933,9 @@ impl Receiver {
         let PlaybackState::Playing(snapshot) = &self.playback else {
             return;
         };
+        if !self.position_settled {
+            return;
+        }
         let (generation, position) = (snapshot.generation, snapshot.position);
         let found = self
             .segments
@@ -1531,6 +1540,15 @@ mod tests {
         })
     }
 
+    /// mpv's first confirmed position for the item, which opens the button.
+    fn settle(r: &mut Receiver, g: Generation, secs: u64) -> Vec<ReceiverAction> {
+        r.handle(ReceiverEvent::PlayerPositionChanged {
+            generation: g,
+            position: Duration::from_secs(secs),
+            seek_completed: true,
+        })
+    }
+
     fn show(g: Generation, kind: SegmentKind) -> ReceiverAction {
         ReceiverAction::ShowSkipButton {
             generation: g,
@@ -1546,7 +1564,35 @@ mod tests {
         let mut r = Receiver::new();
         let g = begin_playing(&mut r, "a", 70);
         assert!(segments(&mut r, g, list).is_empty());
+        settle(&mut r, g, 0);
         (r, g)
+    }
+
+    #[test]
+    fn no_button_before_the_first_settled_position() {
+        let mut r = Receiver::new();
+        let g = begin_playing(&mut r, "a", 70);
+        assert!(at(&mut r, g, 0).is_empty());
+        let list = vec![
+            seg(SegmentKind::Recap, 0, 4, false),
+            seg(SegmentKind::Intro, 5, 20, false),
+        ];
+        assert!(segments(&mut r, g, list).is_empty(), "inside the recap");
+        assert!(at(&mut r, g, 8).is_empty(), "inside the intro");
+        let actions = settle(&mut r, g, 8);
+        assert!(
+            matches!(actions.as_slice(), [ReceiverAction::ReportProgress(_), s] if *s == show(g, SegmentKind::Intro)),
+            "{actions:?}"
+        );
+    }
+
+    #[test]
+    fn the_next_item_must_settle_again() {
+        let (mut r, g) = playing_with(vec![]);
+        r.handle(ended(g, EndReason::Eof));
+        let g2 = begin_playing(&mut r, "b", 80);
+        assert!(segments(&mut r, g2, vec![seg(SegmentKind::Intro, 0, 20, false)]).is_empty());
+        assert!(at(&mut r, g2, 8).is_empty());
     }
 
     #[test]
@@ -1562,7 +1608,7 @@ mod tests {
     fn segments_arriving_mid_segment_show_the_button_at_once() {
         let mut r = Receiver::new();
         let g = begin_playing(&mut r, "a", 70);
-        at(&mut r, g, 8);
+        settle(&mut r, g, 8);
         assert_eq!(
             segments(&mut r, g, vec![seg(SegmentKind::Intro, 5, 20, false)]),
             vec![show(g, SegmentKind::Intro)]
@@ -1573,6 +1619,7 @@ mod tests {
     fn stale_segments_are_ignored() {
         let mut r = Receiver::new();
         let g = begin_playing(&mut r, "a", 70);
+        settle(&mut r, g, 0);
         assert!(
             segments(
                 &mut r,
@@ -1690,6 +1737,7 @@ mod tests {
         at(&mut r, g, 10);
         r.handle(ended(g, EndReason::Eof));
         let g2 = begin_playing(&mut r, "b", 80);
+        settle(&mut r, g2, 0);
         assert!(at(&mut r, g2, 10).is_empty());
     }
 

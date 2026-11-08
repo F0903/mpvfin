@@ -84,8 +84,9 @@ is meant to change, and a remote unpause, which clears the user's own pause.
 After `MediaResolved`, the `jobs` thread fetches the item's media segments
 (`GET /MediaSegments/{id}`), so playback never waits for them, and answers with
 `SegmentsResolved`. The reducer checks them on every position change and emits
-`ShowSkipButton` and `HideSkipButton`. A skipped segment stays dismissed until
-playback leaves it.
+`ShowSkipButton` and `HideSkipButton`, starting at mpv's first `playback-restart`
+for the item, so a cast with a start position cannot show a button from before
+it. A skipped segment stays dismissed until playback leaves it.
 
 The button is an `osd-overlay` plus two mpv input sections, defined at startup
 and inert until enabled, so nothing changes mpv's input while no button is up:

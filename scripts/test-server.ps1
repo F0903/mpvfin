@@ -82,13 +82,16 @@ if (-not ($plugins | Where-Object Id -eq $guid)) {
     & $waitServer
 }
 $dir = "/media/shows/Test Show/Season 1"
-docker compose -f $compose exec -T jellyfin test -f /media/.chapters-v1
+docker compose -f $compose exec -T jellyfin test -f /media/.chapters-v2
 if ($LASTEXITCODE) {
+    # A v1 server already has E01's chapters, which v2 did not change.
+    docker compose -f $compose exec -T jellyfin test -f /media/.chapters-v1
+    $remux = if ($LASTEXITCODE) { @(1, 2) } else { @(2) }
     $chapters = @{
         1 = @(@("Cold Open", 0, 5), @("Intro", 5, 20), @("Part 1", 20, 100), @("Credits", 100, 120))
-        2 = @(@("Recap", 0, 10), @("Part 1", 10, 90), @("Credits", 90, 110), @("Preview", 110, 120))
+        2 = @(@("Recap", 0, 10), @("Part 1", 10, 50), @("Credits", 50, 70), @("Part 2", 70, 110), @("Preview", 110, 120))
     }
-    foreach ($n in 1, 2) {
+    foreach ($n in $remux) {
         $meta = ";FFMETADATA1`n" + (($chapters[$n] | ForEach-Object { "[CHAPTER]`nTIMEBASE=1/1000`nSTART=$($_[1] * 1000)`nEND=$($_[2] * 1000)`ntitle=$($_[0])" }) -join "`n") + "`n"
         $f = "$dir/Test Show - S01E0$n.mkv"
         $meta | docker compose -f $compose exec -T jellyfin sh -c "cat > /tmp/meta$n.txt"
@@ -96,7 +99,7 @@ if ($LASTEXITCODE) {
         dc exec -T jellyfin /usr/lib/jellyfin-ffmpeg/ffmpeg -y -loglevel error -i $f -i /tmp/meta$n.txt -map 0 -map_metadata 0 -map_chapters 1 -c copy "$dir/tmp$n.mkv"
         dc exec -T jellyfin mv "$dir/tmp$n.mkv" $f
     }
-    dc exec -T jellyfin touch /media/.chapters-v1
+    dc exec -T jellyfin touch /media/.chapters-v2
     Invoke-RestMethod "$base/Library/Refresh" -Method Post -Headers $h | Out-Null
     Start-Sleep 5
 }
@@ -107,7 +110,7 @@ function Get-Segments($id) {
     @((Invoke-RestMethod "$base/MediaSegments/$id" -Headers $h).Items | Sort-Object StartTicks |
         ForEach-Object { "$($_.Type):$([math]::Round($_.StartTicks / 1e7)):$([math]::Round($_.EndTicks / 1e7))" })
 }
-$want = @{ 0 = @("Intro:5:20", "Outro:100:120"); 1 = @("Recap:0:10", "Outro:90:110", "Preview:110:120"); 2 = @() }
+$want = @{ 0 = @("Intro:5:20", "Outro:100:120"); 1 = @("Recap:0:10", "Outro:50:70", "Preview:110:120"); 2 = @() }
 $tasks = Invoke-RestMethod "$base/ScheduledTasks" -Headers $h
 $task = $tasks | Where-Object Key -eq "TaskExtractMediaSegments"
 $got = @{}

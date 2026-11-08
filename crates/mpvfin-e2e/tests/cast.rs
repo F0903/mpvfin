@@ -160,7 +160,17 @@ impl Cast {
         });
     }
 
-    /// Asserts playback alone cannot reach `target` s within `wait_position`.
+    /// Waits up to 5 s for `item`, less than the playback `assert_far_from` left.
+    #[track_caller]
+    fn wait_next(&self, item: &str) {
+        poll_until(secs(5), || {
+            self.server
+                .mpvfin_session(&self.device)
+                .filter(|s| s["NowPlayingItem"]["Id"] == item)
+        });
+    }
+
+    /// Asserts playback alone cannot reach `target` s within `wait_position` or `wait_next`.
     #[track_caller]
     fn assert_far_from(&self, target: f64) {
         let position = self.position();
@@ -707,31 +717,61 @@ fn skipping_credits_at_end_of_file_marks_played_and_plays_next() {
     c.wait_playing(e01);
     c.player.command(&["seek", "102", "absolute"]);
     c.wait_button();
+    c.assert_far_from(120.0);
 
     c.press("ENTER");
-    c.wait_playing(e02);
+    c.wait_next(e02);
     poll_until(T10, || c.server.is_played(e01).then_some(()));
 }
 
 #[test]
 #[ignore = "needs ./scripts/test-server.ps1 -Action up"]
-fn skipping_credits_mid_file_lands_on_the_preview() {
+fn skipping_credits_mid_file_marks_played_before_the_watched_point() {
     let c = skip_cast("");
     let e02 = c.items[1].as_str();
     // From 30 s, past E02's recap, so the first button can only be the credits'.
     c.play_one(e02, secs(30));
-    c.player.command(&["seek", "92", "absolute"]);
+    c.wait_position(30.0, 34.0);
+    // Every enable-section is logged, so even a brief button before 30 s shows.
+    let log = c.player.log_text();
+    assert!(
+        !log.lines()
+            .any(|l| l.contains("Run command: enable-section") && l.contains(KEY_SECTION)),
+        "button shown before the requested start"
+    );
+    c.player.command(&["seek", "52", "absolute"]);
     c.wait_button();
+    c.assert_far_from(70.0);
 
     c.press("ENTER");
-    c.wait_position(110.0, 114.0);
+    c.wait_position(70.0, 74.0);
     c.wait_playing(e02);
     poll_until(T10, || c.server.is_played(e02).then_some(()));
+    assert!(c.position() < 108.0, "reached the 90% watched point");
+}
 
-    c.wait_button();
-    c.press("ENTER");
+#[test]
+#[ignore = "needs ./scripts/test-server.ps1 -Action up"]
+fn skipping_the_preview_at_end_of_file_ends_the_item() {
+    let c = skip_cast("");
+    let (e02, e03) = (c.items[1].as_str(), c.items[2].as_str());
     // Jellyfin queues the rest of the season behind one episode, so E03 follows.
-    c.session_where(|s| s["NowPlayingItem"]["Id"] != e02);
+    c.play_one(e02, secs(30));
+    c.player.command(&["seek", "112", "absolute"]);
+    c.wait_button();
+    c.assert_far_from(120.0);
+
+    c.press("ENTER");
+    c.wait_next(e03);
+}
+
+#[test]
+#[ignore = "needs ./scripts/test-server.ps1 -Action up"]
+fn button_appears_for_a_cast_from_the_start_of_the_file() {
+    let c = skip_cast("");
+    // E02 opens with a recap, so a button needs the settled position at 0 s.
+    c.play_one(&c.items[1], Duration::ZERO);
+    c.wait_button();
 }
 
 #[test]

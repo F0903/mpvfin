@@ -761,6 +761,30 @@ fn double_click_skips_only_once_and_leaves_fullscreen_alone() {
 
 #[test]
 #[ignore = "needs ./scripts/test-server.ps1 -Action up"]
+fn an_open_uosc_menu_keeps_clicks_off_the_button() {
+    let c = skip_cast("");
+    c.play_one(&c.items[0], secs(8));
+    c.wait_button();
+    c.hover_button();
+
+    c.player
+        .command(&["set", "user-data/uosc/menu/type", "test"]);
+    c.wait_click_section(false);
+    c.press("MBTN_LEFT");
+    // No state to poll: this waits for a skip that must not happen.
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(c.position() < 20.0, "the click went through the menu");
+    assert!(!section_active(&c.player, CLICK_SECTION));
+
+    c.player.command(&["del", "user-data/uosc/menu/type"]);
+    c.wait_click_section(true);
+    c.assert_far_from(20.0);
+    c.press("MBTN_LEFT");
+    c.wait_position(20.0, 24.0);
+}
+
+#[test]
+#[ignore = "needs ./scripts/test-server.ps1 -Action up"]
 fn user_input_conf_binding_wins_over_the_default_hotkey() {
     let c = skip_cast("ENTER set pause yes\n");
     c.play_one(&c.items[0], secs(8));

@@ -406,6 +406,8 @@ pub enum ReceiverEvent {
     },
     /// mpv opened a file that is not a Jellyfin entry.
     PlayerOpenedForeign,
+    /// mpv has nothing open and nothing coming.
+    PlayerIdle,
     /// The drift corrector wants a seek.
     DriftSeek {
         /// Playback generation.
@@ -901,7 +903,11 @@ impl Receiver {
                             message,
                         });
                     }
-                    self.group_load_ended(&mut actions);
+                    if stop == StopReason::Stopped {
+                        self.group_load_stopped();
+                    } else {
+                        self.group_load_ended(&mut actions);
+                    }
                 }
             }
             ReceiverEvent::RemotePause => self.control_pause(true, &mut actions),
@@ -999,6 +1005,7 @@ impl Receiver {
                 buffering,
             } => self.group_buffering(generation, buffering, &mut actions),
             ReceiverEvent::PlayerOpenedForeign => self.group_opened_foreign(&mut actions),
+            ReceiverEvent::PlayerIdle => self.group_idle(&mut actions),
             ReceiverEvent::DriftSeek {
                 generation,
                 position,

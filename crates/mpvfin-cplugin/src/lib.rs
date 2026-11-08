@@ -4,6 +4,8 @@
 //! [`runtime::run`], which drives the event loop until mpv shuts down.
 
 pub mod adapter;
+#[allow(dead_code)] // wired in Task 7
+mod drift;
 pub mod ffi;
 pub mod mpv;
 pub mod runtime;

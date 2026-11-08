@@ -392,6 +392,27 @@ pub enum ReceiverEvent {
         /// Why it ended.
         reason: EndReason,
     },
+    /// mpv reached the end of the entry and is holding there.
+    PlayerReachedEnd {
+        /// Playback generation.
+        generation: Generation,
+    },
+    /// mpv paused for the cache, or resumed from it.
+    PlayerBuffering {
+        /// Playback generation.
+        generation: Generation,
+        /// Whether playback is stalled.
+        buffering: bool,
+    },
+    /// mpv opened a file that is not a Jellyfin entry.
+    PlayerOpenedForeign,
+    /// The drift corrector wants a seek.
+    DriftSeek {
+        /// Playback generation.
+        generation: Generation,
+        /// Where the group is now.
+        position: Duration,
+    },
     /// Jellyfin returned the item's media segments.
     SegmentsResolved {
         /// Generation attached to the request.
@@ -681,6 +702,17 @@ impl Receiver {
         let mut actions = Vec::new();
 
         match event {
+            ReceiverEvent::RemoteNext
+            | ReceiverEvent::RemotePrevious
+            | ReceiverEvent::RemotePause
+            | ReceiverEvent::RemoteResume
+            | ReceiverEvent::RemoteTogglePause
+            | ReceiverEvent::RemoteSeek(_)
+            | ReceiverEvent::RemoteStop
+                if self.group.is_some() =>
+            {
+                self.group_control(&event, &mut actions);
+            }
             ReceiverEvent::RemotePlay(request) => {
                 self.pending_selection = match request.mode {
                     QueueMode::Replace if request.selection != StreamSelection::default() => {
@@ -694,7 +726,11 @@ impl Receiver {
                     }
                     _ => None,
                 };
-                actions.push(ReceiverAction::QueueItems(request));
+                if self.group.is_some() {
+                    Self::group_remote_play(request, &mut actions);
+                } else {
+                    actions.push(ReceiverAction::QueueItems(request));
+                }
             }
             ReceiverEvent::RemoteNext if self.current_generation().is_some() => {
                 actions.push(ReceiverAction::PlaylistNext);
@@ -724,6 +760,7 @@ impl Receiver {
                     item_id: item_id.clone(),
                     selection,
                 };
+                self.group_opening(&mut actions);
                 actions.push(ReceiverAction::ResolveMedia {
                     generation,
                     token,
@@ -796,8 +833,8 @@ impl Receiver {
                     snapshot.position = position;
                     if seek_completed {
                         actions.push(ReceiverAction::ReportProgress(snapshot.clone()));
-                        self.position_settled = true;
                         self.group_position_settled(generation, position, &mut actions);
+                        self.position_settled = true;
                     }
                     self.evaluate_segments(&mut actions);
                 }
@@ -808,6 +845,7 @@ impl Receiver {
                 {
                     snapshot.paused = paused;
                     actions.push(ReceiverAction::ReportProgress(snapshot.clone()));
+                    self.group_pause_changed(paused, &mut actions);
                 }
             }
             ReceiverEvent::PlayerVolumeChanged {
@@ -939,17 +977,32 @@ impl Receiver {
                         });
                     }
                     actions.push(ReceiverAction::HideSkipButton { generation });
-                    actions.push(if segment.to_end_of_file {
-                        ReceiverAction::SeekToEnd { generation }
-                    } else {
-                        ReceiverAction::Seek {
+                    match (self.group_on_item().is_some(), segment.to_end_of_file) {
+                        (true, true) => self.group_reached_end(generation, &mut actions),
+                        (true, false) => actions.push(ReceiverAction::Group(GroupRequest::Seek {
+                            position: segment.end,
+                        })),
+                        (false, true) => actions.push(ReceiverAction::SeekToEnd { generation }),
+                        (false, false) => actions.push(ReceiverAction::Seek {
                             generation,
                             position: segment.end,
-                        }
-                    });
+                        }),
+                    }
                     self.dismissed = Some(segment);
                 }
             }
+            ReceiverEvent::PlayerReachedEnd { generation } => {
+                self.group_reached_end(generation, &mut actions);
+            }
+            ReceiverEvent::PlayerBuffering {
+                generation,
+                buffering,
+            } => self.group_buffering(generation, buffering, &mut actions),
+            ReceiverEvent::PlayerOpenedForeign => self.group_opened_foreign(&mut actions),
+            ReceiverEvent::DriftSeek {
+                generation,
+                position,
+            } => self.group_drift_seek(generation, position, &mut actions),
             ReceiverEvent::GroupCreate { name } => self.group_create(name, &mut actions),
             ReceiverEvent::GroupJoin { group_id } => self.group_join(group_id, &mut actions),
             ReceiverEvent::GroupLeave => self.group_leave(&mut actions),
@@ -1085,7 +1138,6 @@ impl Receiver {
                 let generation = *generation;
                 self.terminate_current(StopReason::Stopped, actions);
                 actions.push(ReceiverAction::StopPlayer { generation });
-                self.group_load_ended(actions);
             }
         }
     }

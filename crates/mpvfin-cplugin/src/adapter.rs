@@ -151,12 +151,6 @@ pub fn format_seconds(d: Duration) -> String {
     format!("{}.{:03}", d.as_secs(), d.subsec_millis())
 }
 
-/// Escapes `$` so mpv's property expansion prints `text` literally.
-#[must_use]
-pub fn escape_osd(text: &str) -> String {
-    text.replace('$', "$$")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -374,10 +368,5 @@ mod tests {
             end_reason(MPV_END_FILE_REASON_ERROR, Some("loading failed".into())),
             EndReason::Failed("loading failed".into())
         );
-    }
-
-    #[test]
-    fn osd_text_escapes_property_expansion() {
-        assert_eq!(escape_osd("a ${x} $"), "a $${x} $$");
     }
 }

@@ -1,16 +1,17 @@
 //! Safe wrapper over the mpv client API.
 
+use std::cell::RefCell;
+use std::collections::HashSet;
 use std::ffi::{CStr, CString, c_char, c_int};
 use std::ptr;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use crate::adapter::escape_osd;
 use crate::ffi::{
-    self, MPV_FORMAT_NONE, MPV_FORMAT_STRING, MpvCommandFn, MpvCommandRetFn, MpvErrorStringFn,
-    MpvEvent, MpvFreeFn, MpvFreeNodeContentsFn, MpvGetPropertyStringFn, MpvHandle, MpvHookAddFn,
-    MpvHookContinueFn, MpvNode, MpvNodeValue, MpvObservePropertyFn, MpvSetPropertyStringFn,
-    MpvWaitEventFn, MpvWakeupFn,
+    self, MPV_EVENT_HOOK, MPV_FORMAT_NONE, MPV_FORMAT_STRING, MpvCommandFn, MpvCommandRetFn,
+    MpvErrorStringFn, MpvEvent, MpvEventHook, MpvFreeFn, MpvFreeNodeContentsFn,
+    MpvGetPropertyStringFn, MpvHandle, MpvHookAddFn, MpvHookContinueFn, MpvNode, MpvNodeValue,
+    MpvObservePropertyFn, MpvSetPropertyStringFn, MpvWaitEventFn, MpvWakeupFn,
 };
 
 /// The plugin's mpv client handle.
@@ -30,6 +31,7 @@ pub struct Mpv {
     hook_add: MpvHookAddFn,
     hook_continue: MpvHookContinueFn,
     error_string: MpvErrorStringFn,
+    pending_hooks: PendingHooks,
     waker: Waker,
 }
 
@@ -59,6 +61,7 @@ impl Mpv {
                 hook_add: ffi::pfn_mpv_hook_add?,
                 hook_continue: ffi::pfn_mpv_hook_continue?,
                 error_string: ffi::pfn_mpv_error_string?,
+                pending_hooks: PendingHooks::default(),
                 waker: Waker::new(handle, ffi::pfn_mpv_wakeup?),
             })
         }
@@ -69,7 +72,15 @@ impl Mpv {
         // SAFETY: the handle is live and only this thread waits on it. mpv
         // keeps the event valid until the next wait, which needs `&mut self`
         // and so cannot happen while the returned borrow lives.
-        unsafe { (self.wait_event)(self.handle, timeout).as_ref() }
+        let event = unsafe { (self.wait_event)(self.handle, timeout).as_ref() }?;
+        if event.event_id == MPV_EVENT_HOOK {
+            // SAFETY: client.h: a HOOK event's data is an `mpv_event_hook`,
+            // valid until the next wait.
+            if let Some(hook) = unsafe { event.data.cast::<MpvEventHook>().as_ref() } {
+                self.pending_hooks.add(hook.id);
+            }
+        }
+        Some(event)
     }
 
     /// Runs a command.
@@ -165,33 +176,32 @@ impl Mpv {
         self.log_failure("hook_add", name, result);
     }
 
-    /// Continues a hook received from `wait_event`.
+    /// Continues a hook received from `wait_event`; any other id, or a second
+    /// continue of the same id, is logged and ignored.
     pub fn hook_continue(&self, id: u64) {
-        // SAFETY: client.h makes continuing a hook twice, or an id that never
-        // arrived, undefined; the core reducer continues every hook id it is
-        // given exactly once.
+        if !self.pending_hooks.take(id) {
+            self.log(&format!("hook_continue {id}: not a pending hook"));
+            return;
+        }
+        // SAFETY: `id` arrived in a HOOK event on this handle and was just
+        // removed from the pending set, so it is continued exactly once.
         let result = self.check(unsafe { (self.hook_continue)(self.handle, id) });
         self.log_failure("hook_continue", &id.to_string(), result);
     }
 
-    /// Prints `[mpvfin] <line>` to mpv's terminal output.
+    /// Prints `[mpvfin] <line>` to mpv's terminal output, literally:
+    /// `mpv_command` does not expand `${...}` properties.
     pub fn log(&self, line: &str) {
-        let text = format!("[mpvfin] {}", escape_osd(line));
-        // mpv_command does not expand properties by default; enabling it keeps
-        // escape_osd's "$$" printing as "$".
-        if self
-            .command(&["expand-properties", "print-text", &text])
-            .is_err()
-        {
-            eprintln!("[mpvfin] {line}");
+        let text = format!("[mpvfin] {line}");
+        if self.command(&["print-text", &text]).is_err() {
+            eprintln!("{text}");
         }
     }
 
-    /// Shows `text` on the OSD for `duration`.
+    /// Shows `text` literally on the OSD for `duration`.
     pub fn show_text(&self, text: &str, duration: Duration) {
         let ms = duration.as_millis().to_string();
-        let text = escape_osd(text);
-        if let Err(e) = self.command(&["expand-properties", "show-text", &text, &ms]) {
+        if let Err(e) = self.command(&["show-text", text, &ms]) {
             self.log(&e);
         }
     }
@@ -257,6 +267,22 @@ unsafe fn from_c(raw: *const c_char) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// Hook ids received from `wait_event` and not yet continued. mpv makes
+/// continuing any other id, or one id twice, undefined behaviour.
+#[derive(Default)]
+struct PendingHooks(RefCell<HashSet<u64>>);
+
+impl PendingHooks {
+    fn add(&mut self, id: u64) {
+        self.0.get_mut().insert(id);
+    }
+
+    /// Removes `id`; `false` if it was not pending.
+    fn take(&self, id: u64) -> bool {
+        self.0.borrow_mut().remove(&id)
+    }
+}
+
 /// Handle pointer that may cross threads.
 struct SendPtr(*mut MpvHandle);
 
@@ -298,6 +324,15 @@ mod tests {
 
     extern "C" fn count_wake(_: *mut MpvHandle) {
         WAKES.fetch_add(1, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn hooks_continue_once_and_unknown_ids_are_rejected() {
+        let mut pending = PendingHooks::default();
+        pending.add(7);
+        assert!(pending.take(7));
+        assert!(!pending.take(7), "second continue of the same id");
+        assert!(!pending.take(8), "id that never arrived");
     }
 
     #[test]

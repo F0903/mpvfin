@@ -3,12 +3,16 @@
 use std::ffi::c_int;
 use std::time::Duration;
 
-use mpvfin_core::{EndReason, Generation, QueueMode, QueueRequest, ResolvedMedia, StreamSelection};
+use mpvfin_core::{
+    EndReason, Generation, GroupEntry, QueueMode, QueueRequest, ResolvedMedia, StreamSelection,
+};
 
 use crate::ffi::{MPV_END_FILE_REASON_EOF, MPV_END_FILE_REASON_ERROR};
 
 /// URL scheme of the playlist entries mpvfin queues.
 pub const ENTRY_SCHEME: &str = "mpvfin://";
+
+const NO_RESUME: &str = "resume-playback=no";
 
 /// Kind of track a Jellyfin stream index refers to.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -23,24 +27,95 @@ pub fn entry_uri(item_id: &str) -> String {
     format!("{ENTRY_SCHEME}{item_id}")
 }
 
-/// Jellyfin item ID of an mpvfin playlist entry; `None` for any other path.
+/// Playlist entry URL for an entry of a `SyncPlay` queue.
 #[must_use]
-pub fn item_id_from_entry(uri: &str) -> Option<&str> {
-    uri.strip_prefix(ENTRY_SCHEME).filter(|id| !id.is_empty())
+pub fn group_entry_uri(item_id: &str, pid: &str) -> String {
+    format!("{ENTRY_SCHEME}{item_id}/{pid}")
+}
+
+/// Jellyfin item ID of an mpvfin playlist entry and the `SyncPlay` queue entry
+/// it names, if any; `None` for any other path.
+#[must_use]
+pub fn entry_from_uri(uri: &str) -> Option<(&str, Option<&str>)> {
+    let rest = uri.strip_prefix(ENTRY_SCHEME)?;
+    let (id, pid) = rest.split_once('/').unwrap_or((rest, ""));
+    (!id.is_empty()).then_some((id, Some(pid).filter(|pid| !pid.is_empty())))
+}
+
+fn loadfile(uri: String, flag: &str, index: String, options: String) -> Vec<String> {
+    vec!["loadfile".to_owned(), uri, flag.to_owned(), index, options]
+}
+
+/// Commands queuing `uris` around `uris[current]`, the entry already in place.
+fn commands_around(uris: &[String], current: usize) -> Vec<Vec<String>> {
+    let later = uris[current + 1..]
+        .iter()
+        .map(|uri| loadfile(uri.clone(), "append", "-1".into(), NO_RESUME.into()));
+    let earlier = uris[..current]
+        .iter()
+        .enumerate()
+        .map(|(i, uri)| loadfile(uri.clone(), "insert-at", i.to_string(), NO_RESUME.into()));
+    later.chain(earlier).collect()
+}
+
+fn group_uris(entries: &[GroupEntry]) -> Vec<String> {
+    entries
+        .iter()
+        .map(|e| group_entry_uri(&e.item_id, &e.playlist_item_id))
+        .collect()
+}
+
+/// Replaces mpv's playlist with the group's queue, opening `entries[index]`.
+/// The start position is the hook's: the group can move it until then.
+#[must_use]
+pub fn group_load_commands(entries: &[GroupEntry], index: usize) -> Vec<Vec<String>> {
+    let uris = group_uris(entries);
+    let current = uris[index].clone();
+    let mut commands = vec![loadfile(current, "replace", "-1".into(), NO_RESUME.into())];
+    commands.extend(commands_around(&uris, index));
+    commands
+}
+
+/// Mirrors the group's queue around the playing entry, which `playlist-clear` keeps.
+#[must_use]
+pub fn group_sync_commands(entries: &[GroupEntry], index: usize) -> Vec<Vec<String>> {
+    let mut commands = vec![vec!["playlist-clear".to_owned()]];
+    commands.extend(commands_around(&group_uris(entries), index));
+    commands
+}
+
+/// What a new group queue takes from mpv's playlist: the mpvfin entries' item
+/// ids, and the index among them of the entry at `current`.
+#[must_use]
+pub fn published_queue(filenames: &[String], current: usize) -> (Vec<String>, usize) {
+    let item_ids = |names: &[String]| -> Vec<String> {
+        names
+            .iter()
+            .filter_map(|name| entry_from_uri(name))
+            .map(|(item_id, _)| item_id.to_owned())
+            .collect()
+    };
+    let before = &filenames[..current.min(filenames.len())];
+    (item_ids(filenames), item_ids(before).len())
+}
+
+/// The binding a client message reports as pressed: state `d` is a key going
+/// down, `p` a press whose up and down can't be told apart.
+#[must_use]
+pub fn key_press_name(args: &[String]) -> Option<&str> {
+    match args {
+        [message, name, state, ..] if message == "key-binding" && state.starts_with(['d', 'p']) => {
+            Some(name)
+        }
+        _ => None,
+    }
 }
 
 /// `loadfile` commands that queue the request's items.
 #[must_use]
 pub fn queue_commands(req: &QueueRequest) -> Vec<Vec<String>> {
-    const NO_RESUME: &str = "resume-playback=no";
     let load = |id: &str, flag: &str, index: String, options: String| {
-        vec![
-            "loadfile".to_owned(),
-            entry_uri(id),
-            flag.to_owned(),
-            index,
-            options,
-        ]
+        loadfile(entry_uri(id), flag, index, options)
     };
     let ids = &req.item_ids;
     match req.mode {
@@ -55,17 +130,8 @@ pub fn queue_commands(req: &QueueRequest) -> Vec<Vec<String>> {
                 format!("start={},{NO_RESUME}", format_seconds(req.start_position))
             };
             let mut commands = vec![load(&ids[start], "replace", "-1".into(), options)];
-            commands.extend(
-                ids[start + 1..]
-                    .iter()
-                    .map(|id| load(id, "append", "-1".into(), NO_RESUME.into())),
-            );
-            commands.extend(
-                ids[..start]
-                    .iter()
-                    .enumerate()
-                    .map(|(i, id)| load(id, "insert-at", i.to_string(), NO_RESUME.into())),
-            );
+            let uris: Vec<String> = ids.iter().map(|id| entry_uri(id)).collect();
+            commands.extend(commands_around(&uris, start));
             commands
         }
         QueueMode::Next => ids
@@ -97,6 +163,19 @@ pub fn hook_properties(
             "file-local-options/watch-later-dir",
             watch_later_dir.to_owned(),
         ),
+    ]
+}
+
+/// What the hook adds for an entry of a `SyncPlay` queue: it loads paused until
+/// the group starts, and holds at the end until the server moves on, without
+/// `keep-open-pause` so that holding doesn't look like a local pause.
+#[must_use]
+pub fn group_hook_properties(start: Duration) -> Vec<(&'static str, String)> {
+    vec![
+        ("file-local-options/pause", "yes".to_owned()),
+        ("file-local-options/keep-open", "always".to_owned()),
+        ("file-local-options/keep-open-pause", "no".to_owned()),
+        ("file-local-options/start", format_seconds(start)),
     ]
 }
 
@@ -234,7 +313,7 @@ mod tests {
     use crate::ffi::{
         MPV_END_FILE_REASON_QUIT, MPV_END_FILE_REASON_REDIRECT, MPV_END_FILE_REASON_STOP,
     };
-    use mpvfin_core::{Generation, PlayMethod, TrackMap};
+    use mpvfin_core::{Generation, GroupEntry, PlayMethod, TrackMap};
 
     fn cmd(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|s| (*s).to_owned()).collect()
@@ -466,9 +545,104 @@ mod tests {
     #[test]
     fn entries_are_recognised_and_foreign_paths_are_not() {
         assert_eq!(entry_uri("abc"), "mpvfin://abc");
-        assert_eq!(item_id_from_entry("mpvfin://abc"), Some("abc"));
-        assert_eq!(item_id_from_entry(r"C:\v.mkv"), None);
-        assert_eq!(item_id_from_entry("https://x/y"), None);
+        assert_eq!(entry_from_uri("mpvfin://abc"), Some(("abc", None)));
+        assert_eq!(entry_from_uri(r"C:\v.mkv"), None);
+        assert_eq!(entry_from_uri("https://x/y"), None);
+    }
+
+    fn group_entries(names: &[&str]) -> Vec<GroupEntry> {
+        names
+            .iter()
+            .map(|name| GroupEntry {
+                item_id: (*name).to_owned(),
+                playlist_item_id: format!("p{name}"),
+            })
+            .collect()
+    }
+
+    fn group_cmd(uri: &str, flag: &str, index: &str) -> Vec<String> {
+        cmd(&["loadfile", uri, flag, index, "resume-playback=no"])
+    }
+
+    #[test]
+    fn group_uris_round_trip() {
+        let uri = group_entry_uri("abc", "pabc");
+        assert_eq!(uri, "mpvfin://abc/pabc");
+        assert_eq!(entry_from_uri(&uri), Some(("abc", Some("pabc"))));
+    }
+
+    #[test]
+    fn plain_entries_have_no_pid() {
+        assert_eq!(entry_from_uri("mpvfin://abc"), Some(("abc", None)));
+        assert_eq!(entry_from_uri("mpvfin://abc/"), Some(("abc", None)));
+        assert_eq!(entry_from_uri("mpvfin://"), None);
+        assert_eq!(entry_from_uri("mpvfin:///pabc"), None);
+    }
+
+    #[test]
+    fn group_load_commands_match_the_queue_shape() {
+        assert_eq!(
+            group_load_commands(&group_entries(&["a", "b", "c", "d"]), 2),
+            vec![
+                group_cmd("mpvfin://c/pc", "replace", "-1"),
+                group_cmd("mpvfin://d/pd", "append", "-1"),
+                group_cmd("mpvfin://a/pa", "insert-at", "0"),
+                group_cmd("mpvfin://b/pb", "insert-at", "1"),
+            ]
+        );
+    }
+
+    #[test]
+    fn group_sync_keeps_the_current_entry() {
+        assert_eq!(
+            group_sync_commands(&group_entries(&["a", "b", "c", "d"]), 2),
+            vec![
+                cmd(&["playlist-clear"]),
+                group_cmd("mpvfin://d/pd", "append", "-1"),
+                group_cmd("mpvfin://a/pa", "insert-at", "0"),
+                group_cmd("mpvfin://b/pb", "insert-at", "1"),
+            ]
+        );
+    }
+
+    #[test]
+    fn group_hook_holds_at_the_end_and_loads_paused() {
+        assert_eq!(
+            group_hook_properties(Duration::from_millis(20_500)),
+            vec![
+                ("file-local-options/pause", "yes".to_owned()),
+                ("file-local-options/keep-open", "always".to_owned()),
+                ("file-local-options/keep-open-pause", "no".to_owned()),
+                ("file-local-options/start", "20.500".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_published_queue_keeps_mpvfin_entries_and_finds_the_current_one() {
+        let names = ["mpvfin://a", r"C:\v.mkv", "mpvfin://b/pb", "mpvfin://c"].map(str::to_owned);
+        assert_eq!(
+            published_queue(&names, 2),
+            (vec!["a".to_owned(), "b".to_owned(), "c".to_owned()], 1)
+        );
+    }
+
+    #[test]
+    fn key_press_names_are_reported_only_on_press() {
+        let cases: &[(&[&str], Option<&str>)] = &[
+            (&["key-binding", "skip", "d--", "ENTER"], Some("skip")),
+            (&["key-binding", "skip", "p--", "ENTER"], Some("skip")),
+            (&["key-binding", "skip", "dm-", "MBTN_LEFT"], Some("skip")),
+            (&["key-binding", "other", "d--", "ENTER"], Some("other")),
+            (&["key-binding", "skip", "r--", "ENTER"], None),
+            (&["key-binding", "skip", "u--", "ENTER"], None),
+            (&["something-else", "skip", "d--"], None),
+            (&["key-binding", "skip"], None),
+            (&[], None),
+        ];
+        for (args, expected) in cases {
+            assert_eq!(key_press_name(&cmd(args)), *expected, "{args:?}");
+        }
     }
 
     #[test]

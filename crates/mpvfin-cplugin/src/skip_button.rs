@@ -131,14 +131,6 @@ pub fn set_section_command(section: &str, enabled: bool) -> Vec<String> {
     command
 }
 
-/// Whether a client message is a press of the `skip` binding: state `d` is a
-/// key going down, `p` a press whose up and down can't be told apart.
-#[must_use]
-pub fn is_skip_press(args: &[String]) -> bool {
-    matches!(args, [message, name, state, ..]
-        if message == "key-binding" && name == "skip" && state.starts_with(['d', 'p']))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -251,23 +243,5 @@ mod tests {
             set_section_command(CLICK_SECTION, false),
             cmd(&["disable-section", "mpvfin-skip-click"])
         );
-    }
-
-    #[test]
-    fn only_presses_of_skip_count() {
-        let cases: &[(&[&str], bool)] = &[
-            (&["key-binding", "skip", "d--", "ENTER"], true),
-            (&["key-binding", "skip", "p--", "ENTER"], true),
-            (&["key-binding", "skip", "dm-", "MBTN_LEFT"], true),
-            (&["key-binding", "skip", "r--", "ENTER"], false),
-            (&["key-binding", "skip", "u--", "ENTER"], false),
-            (&["key-binding", "other", "d--", "ENTER"], false),
-            (&["something-else", "skip", "d--"], false),
-            (&["key-binding", "skip"], false),
-            (&[], false),
-        ];
-        for (args, expected) in cases {
-            assert_eq!(is_skip_press(&cmd(args)), *expected, "{args:?}");
-        }
     }
 }

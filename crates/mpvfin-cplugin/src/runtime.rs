@@ -8,17 +8,18 @@ use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 use mpvfin_core::{
-    Generation, PlayerToken, Receiver, ReceiverAction, ReceiverEvent, ResolvedMedia, SegmentKind,
-    StopReason, StreamSelection,
+    Generation, GroupEntry, GroupRequest, PlayerToken, Receiver, ReceiverAction, ReceiverEvent,
+    ResolvedMedia, SegmentKind, StopReason, StreamSelection,
 };
 use mpvfin_jellyfin::{Job, Paths, Report, SessionEvent, SessionHandle};
 
 use crate::adapter::{self, SubtitleStep, SubtitleWait, TrackKind};
+use crate::drift::{DriftAction, DriftCorrector};
 use crate::ffi::{
     MPV_EVENT_CLIENT_MESSAGE, MPV_EVENT_COMMAND_REPLY, MPV_EVENT_END_FILE, MPV_EVENT_FILE_LOADED,
-    MPV_EVENT_HOOK, MPV_EVENT_PLAYBACK_RESTART, MPV_EVENT_PROPERTY_CHANGE, MPV_EVENT_SHUTDOWN,
-    MPV_EVENT_START_FILE, MPV_FORMAT_NONE, MPV_FORMAT_STRING, MpvEvent, MpvEventClientMessage,
-    MpvEventEndFile, MpvEventHook, MpvEventProperty, MpvEventStartFile,
+    MPV_EVENT_HOOK, MPV_EVENT_PLAYBACK_RESTART, MPV_EVENT_PROPERTY_CHANGE, MPV_EVENT_SEEK,
+    MPV_EVENT_SHUTDOWN, MPV_EVENT_START_FILE, MPV_FORMAT_NONE, MPV_FORMAT_STRING, MpvEvent,
+    MpvEventClientMessage, MpvEventEndFile, MpvEventHook, MpvEventProperty, MpvEventStartFile,
 };
 use crate::mpv::{Mpv, from_c};
 use crate::skip_button::{self, CLICK_SECTION, KEY_SECTION};
@@ -38,6 +39,9 @@ const SKIP_LINGER: Duration = Duration::from_millis(400);
 /// the string `null` once a menu has closed.
 const UOSC_MENU: &str = "user-data/uosc/menu/type";
 
+/// How long a message about the group stays on the OSD.
+const MESSAGE_DURATION: Duration = Duration::from_secs(5);
+
 /// Runs the plugin until mpv shuts down; the entry point's return value.
 pub fn run(mpv: Mpv) -> c_int {
     mpv.log("loaded");
@@ -50,6 +54,10 @@ pub fn run(mpv: Mpv) -> c_int {
         "sid",
         "osd-width",
         "osd-height",
+        "speed",
+        "eof-reached",
+        "paused-for-cache",
+        "idle-active",
     ] {
         mpv.observe(name, MPV_FORMAT_STRING);
     }
@@ -94,6 +102,10 @@ pub fn run(mpv: Mpv) -> c_int {
         subtitle_wait: None,
         skip_button: None,
         skip_sections_off_at: None,
+        resume_at: None,
+        drift: DriftCorrector::new(),
+        drift_generation: None,
+        seeking: false,
     };
     runtime.define_skip_sections();
     runtime.event_loop();
@@ -110,6 +122,7 @@ enum Event {
         reason: c_int,
         error: c_int,
     },
+    Seek,
     Restart,
     Property(String, Option<String>),
     ClientMessage(Vec<String>),
@@ -149,6 +162,7 @@ impl Event {
                             error: e.error,
                         })
                 }
+                MPV_EVENT_SEEK => Self::Seek,
                 MPV_EVENT_PLAYBACK_RESTART => Self::Restart,
                 MPV_EVENT_PROPERTY_CHANGE => data
                     .cast::<MpvEventProperty>()
@@ -199,6 +213,8 @@ struct Observed {
     osd_width: i64,
     /// 0 while unknown.
     osd_height: i64,
+    speed: f64,
+    eof_reached: bool,
 }
 
 /// The skip button on screen.
@@ -231,6 +247,13 @@ struct Runtime {
     skip_button: Option<SkipButton>,
     /// When the skip input sections go off; `None` leaves them as they are.
     skip_sections_off_at: Option<Instant>,
+    /// When a group's scheduled start is due, for that generation.
+    resume_at: Option<(Instant, Generation)>,
+    drift: DriftCorrector,
+    /// The generation the drift corrector follows.
+    drift_generation: Option<Generation>,
+    /// Between `SEEK` and `PLAYBACK_RESTART`.
+    seeking: bool,
 }
 
 /// The latest `ResolveMedia`, until the job thread answers it.
@@ -249,7 +272,8 @@ impl Runtime {
                 .as_ref()
                 .filter(|pending| !pending.expired)
                 .map(|pending| pending.deadline);
-            let wake = [resolve, self.skip_sections_off_at]
+            let resume = self.resume_at.map(|(at, _)| at);
+            let wake = [resolve, self.skip_sections_off_at, resume]
                 .into_iter()
                 .flatten()
                 .fold(next_tick, Instant::min);
@@ -259,7 +283,10 @@ impl Runtime {
                 return;
             };
             match event {
-                Event::StartFile(entry_id) => self.current = Some(entry_id),
+                Event::StartFile(entry_id) => {
+                    self.current = Some(entry_id);
+                    self.seeking = false;
+                }
                 Event::Hook(hook_id) => self.on_load(hook_id),
                 Event::FileLoaded => self.file_loaded(),
                 Event::EndFile {
@@ -276,18 +303,24 @@ impl Runtime {
                         });
                     }
                 }
+                Event::Seek => self.seeking = true,
                 Event::Restart => {
+                    self.seeking = false;
                     if let Some(generation) = self.current_generation() {
+                        // mpv delivers events ahead of property changes, so the
+                        // observed position can still be from before the seek.
+                        let position = parse_position(self.mpv.get_property("time-pos").as_deref())
+                            .unwrap_or(self.observed.position);
                         self.feed(ReceiverEvent::PlayerPositionChanged {
                             generation,
-                            position: self.observed.position,
+                            position,
                             seek_completed: true,
                         });
                     }
                 }
                 Event::Property(name, value) => self.property(&name, value),
                 Event::ClientMessage(args) => {
-                    if skip_button::is_skip_press(&args) {
+                    if adapter::key_press_name(&args) == Some("skip") {
                         let had_button = self.skip_button.is_some();
                         self.feed(ReceiverEvent::SkipRequested);
                         if had_button && self.skip_button.is_none() {
@@ -302,6 +335,7 @@ impl Runtime {
             self.drain();
             self.expire_resolve();
             self.expire_skip_sections();
+            self.expire_resume();
             if Instant::now() >= next_tick {
                 next_tick = Instant::now() + TICK;
                 self.feed(ReceiverEvent::ProgressTick);
@@ -358,19 +392,28 @@ impl Runtime {
         }
     }
 
+    fn expire_resume(&mut self) {
+        if let Some((at, generation)) = self.resume_at
+            && Instant::now() >= at
+        {
+            self.resume_at = None;
+            self.feed(ReceiverEvent::GroupResumeDue { generation });
+        }
+    }
+
     fn on_load(&mut self, hook_id: u64) {
         let filename = self.mpv.get_property("stream-open-filename");
-        match (
-            self.current,
-            filename.as_deref().and_then(adapter::item_id_from_entry),
-        ) {
-            (Some(entry_id), Some(item_id)) => self.feed(ReceiverEvent::PlayerOpening {
+        let entry = filename.as_deref().and_then(adapter::entry_from_uri);
+        if let (Some(entry_id), Some((item_id, pid))) = (self.current, entry) {
+            self.feed(ReceiverEvent::PlayerOpening {
                 token: PlayerToken { entry_id, hook_id },
                 item_id: item_id.to_owned(),
-                playlist_item_id: None, // wired in Task 7
-            }),
+                playlist_item_id: pid.map(str::to_owned),
+            });
+        } else {
             // Not an mpvfin entry: mpv must not wait for us.
-            _ => self.mpv.hook_continue(hook_id),
+            self.mpv.hook_continue(hook_id);
+            self.feed(ReceiverEvent::PlayerOpenedForeign);
         }
     }
 
@@ -448,9 +491,7 @@ impl Runtime {
                 }
             }
             ("time-pos", v) => {
-                let position = v
-                    .and_then(|v| v.parse::<f64>().ok())
-                    .and_then(|secs| Duration::try_from_secs_f64(secs.max(0.0)).ok());
+                let position = parse_position(v);
                 o.position = position.unwrap_or_default();
                 if position.is_none() {
                     // No file: the reducer keeps the last real position for its stop report.
@@ -468,6 +509,31 @@ impl Runtime {
                 return self.skip_button_resized();
             }
             ("mouse-pos" | UOSC_MENU, _) => return self.update_skip_hover(),
+            ("speed", v) => {
+                if let Some(speed) = v.and_then(|v| v.parse().ok()) {
+                    o.speed = speed;
+                }
+                return;
+            }
+            ("eof-reached", v) => {
+                o.eof_reached = v == Some("yes");
+                if o.eof_reached
+                    && let Some(generation) = self.current_generation()
+                {
+                    self.feed(ReceiverEvent::PlayerReachedEnd { generation });
+                }
+                return;
+            }
+            ("paused-for-cache", v) => {
+                if let Some(generation) = self.current_generation() {
+                    self.feed(ReceiverEvent::PlayerBuffering {
+                        generation,
+                        buffering: v == Some("yes"),
+                    });
+                }
+                return;
+            }
+            ("idle-active", Some("yes")) => return self.feed(ReceiverEvent::PlayerIdle),
             _ => return,
         }
         if let Some(event) = self
@@ -475,6 +541,38 @@ impl Runtime {
             .and_then(|generation| self.player_event(generation, name))
         {
             self.feed(event);
+        }
+        if name == "time-pos" {
+            self.correct_drift();
+        }
+    }
+
+    /// Not while a seek settles (`time-pos` is at the target before `playback-restart`,
+    /// so a viewer's seek would read as drift), nor while paused or held at the end.
+    fn correct_drift(&mut self) {
+        let Some(generation) = self
+            .current_generation()
+            .filter(|generation| Some(*generation) == self.drift_generation)
+        else {
+            return;
+        };
+        let o = &self.observed;
+        if !self.seeking && !o.paused && !o.eof_reached {
+            let action = self.drift.observe(o.position, o.speed, Instant::now());
+            self.apply_drift(generation, action);
+        }
+    }
+
+    fn apply_drift(&mut self, generation: Generation, action: DriftAction) {
+        match action {
+            DriftAction::None => {}
+            DriftAction::SetSpeed(speed) | DriftAction::RestoreSpeed(speed) => {
+                self.set("file-local-options/speed", &speed.to_string());
+            }
+            DriftAction::Seek(position) => self.feed(ReceiverEvent::DriftSeek {
+                generation,
+                position,
+            }),
         }
     }
 
@@ -590,9 +688,15 @@ impl Runtime {
                 hook_id,
                 media,
                 selection,
-                group: _, // wired in Task 7
+                group,
             } => {
-                for (name, value) in adapter::hook_properties(&media, &self.watch_later_dir) {
+                let group_properties = group
+                    .map(|options| adapter::group_hook_properties(options.start))
+                    .unwrap_or_default();
+                for (name, value) in adapter::hook_properties(&media, &self.watch_later_dir)
+                    .into_iter()
+                    .chain(group_properties)
+                {
                     self.set(name, &value);
                 }
                 if let Some(entry) = self
@@ -651,16 +755,67 @@ impl Runtime {
                 self.mpv
                     .show_text(&format!("mpvfin: {message}"), Duration::from_secs(5));
             }
-            // wired in Task 7
-            ReceiverAction::Group(_)
-            | ReceiverAction::GroupLoad { .. }
-            | ReceiverAction::GroupSyncPlaylist { .. }
-            | ReceiverAction::GroupPublishQueue { .. }
-            | ReceiverAction::ScheduleResume { .. }
-            | ReceiverAction::CancelResume
-            | ReceiverAction::DriftAnchor { .. }
-            | ReceiverAction::ShowMessage { .. } => {}
+            ReceiverAction::Group(request) => self.session.submit(Job::Group(request)),
+            ReceiverAction::GroupLoad { entries, index } => self.group_load(&entries, index),
+            ReceiverAction::GroupSyncPlaylist { entries, index } => {
+                for command in adapter::group_sync_commands(&entries, index) {
+                    self.run(&command);
+                }
+            }
+            ReceiverAction::GroupPublishQueue { position } => self.publish_queue(position),
+            ReceiverAction::ScheduleResume { generation, after } => {
+                self.resume_at = Some((Instant::now() + after, generation));
+            }
+            ReceiverAction::CancelResume => self.resume_at = None,
+            ReceiverAction::DriftAnchor {
+                generation,
+                position,
+            } => {
+                self.drift_generation = position.map(|_| generation);
+                let action = self.drift.anchor(position, Instant::now());
+                self.apply_drift(generation, action);
+            }
+            ReceiverAction::ShowMessage { text } => self.mpv.show_text(&text, MESSAGE_DURATION),
         }
+    }
+
+    /// If mpv refuses the entry no hook will ever fire, and the server would
+    /// hold the whole group for a Ready that can't come.
+    fn group_load(&mut self, entries: &[GroupEntry], index: usize) {
+        let commands = adapter::group_load_commands(entries, index);
+        if !commands
+            .first()
+            .is_some_and(|replace| self.try_run(replace))
+        {
+            self.feed(ReceiverEvent::GroupLeave);
+            self.mpv.show_text(
+                "mpvfin: couldn't load that item, so you've left the group",
+                MESSAGE_DURATION,
+            );
+            return;
+        }
+        for command in &commands[1..] {
+            self.run(command);
+        }
+    }
+
+    fn publish_queue(&self, position: Duration) {
+        let number = |name: &str| self.mpv.get_property(name)?.parse::<usize>().ok();
+        // Unavailable entries stay as blanks, so positions stay meaningful.
+        let filenames: Vec<String> = (0..number("playlist/count").unwrap_or(0))
+            .map(|n| {
+                self.mpv
+                    .get_property(&format!("playlist/{n}/filename"))
+                    .unwrap_or_default()
+            })
+            .collect();
+        let current = number("playlist-playing-pos").unwrap_or(0);
+        let (item_ids, index) = adapter::published_queue(&filenames, current);
+        self.session.submit(Job::Group(GroupRequest::SetNewQueue {
+            item_ids,
+            index,
+            start: position,
+        }));
     }
 
     fn select_track(&self, generation: Generation, kind: TrackKind, index: i32) {
@@ -755,10 +910,17 @@ impl Runtime {
 
     /// Runs an mpv command; a failure is logged.
     fn run<S: AsRef<str>>(&self, args: &[S]) {
+        self.try_run(args);
+    }
+
+    /// As [`Self::run`], and says whether the command succeeded.
+    fn try_run<S: AsRef<str>>(&self, args: &[S]) -> bool {
         let args: Vec<&str> = args.iter().map(AsRef::as_ref).collect();
-        if let Err(e) = self.mpv.command(&args) {
-            self.mpv.log(&e);
+        let result = self.mpv.command(&args);
+        if let Err(e) = &result {
+            self.mpv.log(e);
         }
+        result.is_ok()
     }
 
     /// Sets an mpv property; a failure is logged (without the value).
@@ -767,6 +929,13 @@ impl Runtime {
             self.mpv.log(&e);
         }
     }
+}
+
+/// A `time-pos` value; `None` when unavailable.
+fn parse_position(value: Option<&str>) -> Option<Duration> {
+    value
+        .and_then(|v| v.parse::<f64>().ok())
+        .and_then(|secs| Duration::try_from_secs_f64(secs.max(0.0)).ok())
 }
 
 fn yes_no(flag: bool) -> &'static str {

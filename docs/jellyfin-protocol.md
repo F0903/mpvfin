@@ -116,3 +116,28 @@ verified against that image, all unauthenticated until login:
    with body `{"LibraryOptions":{"PathInfos":[{"Path":"/media/shows"}]}}`.
 6. `GET /Items?Recursive=true&IncludeItemTypes=Episode` until
    `TotalRecordCount` is 3.
+
+## Capabilities and playback negotiation (verified against the test server)
+
+- `POST /Sessions/Capabilities/Full` with `capabilities_body()` returns 204.
+  Body: `PlayableMediaTypes ["Video"]`, `SupportedCommands` (SetVolume, Mute,
+  Unmute, ToggleMute, SetAudioStreamIndex, SetSubtitleStreamIndex,
+  DisplayMessage), `SupportsMediaControl`, `SupportsPersistentIdentifier`, and a
+  `DeviceProfile` (direct play only, no transcoding profiles, `Embed` and
+  `External` subtitle profiles for 12 formats).
+- `POST /Items/{id}/PlaybackInfo` with `playback_info_body(userId)` (direct
+  play on, direct stream and transcoding off) returns top-level
+  `PlaySessionId` and `MediaSources[]`. S01E01 yields one source with
+  `Id` (equal to the item id), `SupportsDirectPlay: true`,
+  `RequiresOpening: false`, `IsRemote: false` and `MediaStreams[]`, each with
+  `Index`, `Type` (Video/Audio/Subtitle), `IsExternal`, and for subtitles
+  `DeliveryMethod` (`Embed` or `External`).
+- Stream indices are not grouped: the external `fr` subtitle has `Index 0`
+  (before video 1, audio 2-3, embedded subtitles 4-5). Mapping therefore sorts
+  by `Index` and puts embedded subtitles before external ones.
+- Only the external subtitle has `DeliveryUrl`, e.g.
+  `/Videos/{guid}/{sourceId}/Subtitles/0/0/Stream.subrip?ApiKey=<access token>`.
+  It does carry the API key, so mpvfin strips every `ApiKey`/`api_key`
+  parameter before handing the URL to mpv.
+- Stream URL: `{base}/Videos/{itemId}/stream?static=true&mediaSourceId={sourceId}`,
+  authenticated by the `Authorization` header only.

@@ -45,6 +45,8 @@ pub(crate) struct Group {
     buffering: bool,
     /// The viewer's Pause and Unpause requests whose broadcasts are on their way.
     own_requests: u32,
+    /// mpv hasn't yet confirmed the pause that holds a viewer's resume.
+    hold_unconfirmed: bool,
     /// A `GroupLoad` has not reached mpv's hook yet.
     load_coming: bool,
     /// An entry the server waits on stopped; only mpv going idle makes that final.
@@ -66,6 +68,7 @@ impl Group {
             reached_end: false,
             buffering: false,
             own_requests: 0,
+            hold_unconfirmed: false,
             load_coming: false,
             stopped_owing: false,
         }
@@ -344,6 +347,12 @@ impl Receiver {
         let Some(g) = self.group_on_item() else {
             return;
         };
+        // Can land after the broadcast has already said the group is playing.
+        // shortcut: if mpv merges this pause with an immediate start, no event clears the flag
+        // and the viewer's next pause is lost; only a start with no lead time can do that.
+        if paused && mem::take(&mut g.hold_unconfirmed) {
+            return;
+        }
         // mpv pauses itself when it holds at the end of an item.
         if paused == g.expected_paused || g.reached_end {
             return;
@@ -354,6 +363,7 @@ impl Receiver {
             actions.push(ReceiverAction::Group(GroupRequest::Pause));
             self.stop_following(actions);
         } else {
+            g.hold_unconfirmed = true;
             actions.push(ReceiverAction::Group(GroupRequest::Unpause));
             self.control_pause(true, actions);
         }
@@ -420,6 +430,7 @@ impl Receiver {
         g.reached_end = false;
         g.buffering = false;
         g.own_requests = 0;
+        g.hold_unconfirmed = false;
         g.stopped_owing = false;
         let Some(pid) = self.opened_pid.clone() else {
             return;
@@ -1843,6 +1854,26 @@ mod tests {
         );
         assert!(expected_paused(&r), "held until the broadcast");
         assert!(only_progress(&pause(&mut r, g, true)), "the hold landing");
+    }
+
+    #[test]
+    fn a_hold_confirmed_after_the_broadcast_is_not_the_viewer_pausing() {
+        let (mut r, g) = following("p1", 10);
+        pause(&mut r, g, false);
+        // The server's broadcast overtakes mpv's confirmation of the hold.
+        r.handle(command(GroupCommandKind::Unpause, "p1", secs(10), 500));
+        assert!(only_progress(&pause(&mut r, g, true)), "the hold landing");
+        assert!(
+            r.handle(ReceiverEvent::GroupResumeDue { generation: g })
+                .contains(&set_paused(g, false)),
+            "the scheduled start must survive it"
+        );
+
+        pause(&mut r, g, false);
+        assert!(
+            pause(&mut r, g, true).contains(&req(GroupRequest::Pause)),
+            "a real pause afterwards still reaches the group"
+        );
     }
 
     #[test]

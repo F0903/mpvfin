@@ -10,9 +10,7 @@ types so newer servers remain forward compatible.
 - Persist one opaque device ID across launches.
 - Authenticate REST requests with the modern `MediaBrowser` authorization
   header carrying client name, device name, device ID, version, and token.
-- For the initial prototype, obtain a token with
-  `POST /Users/AuthenticateByName`. Add Quick Connect after the basic receiver
-  lifecycle is reliable.
+- Obtain a token with Quick Connect (see "Quick Connect login" below).
 - Never write access tokens, authorization headers, or authenticated media
   URLs to logs.
 
@@ -141,3 +139,37 @@ verified against that image, all unauthenticated until login:
   parameter before handing the URL to mpv.
 - Stream URL: `{base}/Videos/{itemId}/stream?static=true&mediaSourceId={sourceId}`,
   authenticated by the `Authorization` header only.
+
+## Quick Connect login (verified against the test server)
+
+Checked on 2026-11-08 against the 10.11.11 test image. `Initiate` and
+`AuthenticateWithQuickConnect` need the token-less `Authorization: MediaBrowser
+Client=..., Device=..., DeviceId=..., Version=...` header; `Enabled` and
+`Connect` work without it (mpvfin sends it on every call).
+
+1. `GET /QuickConnect/Enabled` returns the JSON boolean `true` or `false`.
+2. `POST /QuickConnect/Initiate` (no body) returns 200 with `Secret` (64 hex
+   characters), `Code` (six digits), `Authenticated: false`, `DeviceId`,
+   `DeviceName`, `AppName`, `AppVersion` and `DateAdded`. Without the
+   `Authorization` header it returns 400.
+3. `GET /QuickConnect/Connect?secret=<Secret>` returns the same object;
+   `Authenticated` becomes `true` once a user approves the code. An unknown or
+   expired secret returns 404 (`"Unknown secret"`).
+4. Approval happens in another Jellyfin app; the test harness does it as admin
+   with `POST /QuickConnect/Authorize?code=<Code>` (returns 200 `true`).
+5. `POST /Users/AuthenticateWithQuickConnect` with `{"Secret":"<Secret>"}`
+   returns 200 with `User`, `SessionInfo`, `AccessToken` (32 hex characters)
+   and `ServerId`; the session belongs to the header's `DeviceId`. Before
+   approval it returns 404.
+
+mpvfin shows the code, polls step 3 every 3 s, starts over at step 2 on 404,
+and saves `User.Id` and `AccessToken` with the server URL.
+
+Login expiry: with an invalid or revoked token,
+`POST /Sessions/Capabilities/Full` returns 401, and mpvfin restarts Quick
+Connect. Revoking the device (`DELETE /Devices?id=<deviceId>`) makes the
+server close the WebSocket with a normal close first.
+
+The WebSocket stayed connected for over 75 s while mpvfin sent
+`{"MessageType":"KeepAlive"}` every 30 s. On shutdown the server logged the
+`Stopped` report before the socket closed.

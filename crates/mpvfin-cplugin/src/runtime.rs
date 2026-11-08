@@ -628,6 +628,10 @@ impl Runtime {
             ReceiverAction::HideSkipButton { .. } => self.hide_skip_button(),
             ReceiverAction::SeekToEnd { .. } => {
                 self.run(&["seek", "100", "absolute-percent+exact"]);
+                // mpv holds a paused last frame; only unpausing ends the item.
+                if self.observed.paused {
+                    self.set("pause", "no");
+                }
             }
             ReceiverAction::MarkPlayed { item_id, .. } => {
                 self.session.submit(Job::MarkPlayed { item_id });

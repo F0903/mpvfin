@@ -793,6 +793,28 @@ fn skipping_credits_at_end_of_file_marks_played_and_plays_next() {
 
 #[test]
 #[ignore = "needs ./scripts/test-server.ps1 -Action up"]
+fn skipping_credits_at_end_of_file_while_paused_advances() {
+    let c = skip_cast("");
+    let (e01, e02) = (c.items[0].as_str(), c.items[1].as_str());
+    c.server.play(&c.session, &[e01, e02], 0, secs(30));
+    c.wait_playing(e01);
+    c.player.command(&["seek", "102", "absolute"]);
+    c.wait_button();
+
+    c.player.command(&["set", "pause", "yes"]);
+    // Reported, so the plugin has seen the pause before the skip.
+    c.session_where(|s| s["PlayState"]["IsPaused"] == true);
+    c.press("ENTER");
+    poll_until(secs(8), || {
+        c.server
+            .mpvfin_session(&c.device)
+            .filter(|s| s["NowPlayingItem"]["Id"] == e02)
+    });
+    assert_eq!(c.player.get("pause"), json!(false));
+}
+
+#[test]
+#[ignore = "needs ./scripts/test-server.ps1 -Action up"]
 fn skipping_credits_mid_file_marks_played_before_the_watched_point() {
     let c = skip_cast("");
     let e02 = c.items[1].as_str();

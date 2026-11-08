@@ -249,6 +249,7 @@ fn supervise(paths: &Paths, sink: &Sink, stop: &AtomicBool, creds: &Arc<Mutex<Op
     };
     let name = device_name();
     let mut attempt = 0;
+    let mut login_expired = false;
     'session: loop {
         // Each failure breaks out with one log line, then backs off.
         let why = 'attempt: {
@@ -257,8 +258,10 @@ fn supervise(paths: &Paths, sink: &Sink, stop: &AtomicBool, creds: &Arc<Mutex<Op
                 (user_id, Secret::new(token))
             } else {
                 let anonymous = auth_header(&name, &state.device_id, None);
-                match quick_connect(&Client::new(base.clone(), anonymous), sink, stop) {
+                let client = Client::new(base.clone(), anonymous);
+                match quick_connect(&client, login_expired, sink, stop) {
                     Ok(Some((user_id, token))) => {
+                        login_expired = false;
                         state.user_id = Some(user_id.clone());
                         state.access_token = Some(token.expose().to_owned());
                         state.server = Some(base.as_str().to_owned());
@@ -277,11 +280,7 @@ fn supervise(paths: &Paths, sink: &Sink, stop: &AtomicBool, creds: &Arc<Mutex<Op
                     set_creds(creds, None);
                     state.access_token = None;
                     save(&mut file, &state, sink);
-                    osd(
-                        sink,
-                        "mpvfin: Jellyfin login expired, starting Quick Connect",
-                        5,
-                    );
+                    login_expired = true;
                     continue 'session;
                 }
                 Err(e) => break 'attempt format!("Jellyfin registration failed: {e}"),
@@ -354,10 +353,24 @@ fn lock(path: &Path, sink: &Sink, stop: &AtomicBool) -> Option<StateFile> {
     }
 }
 
+/// The Quick Connect OSD. Each refresh replaces the last message, so the
+/// expired-login notice has to be part of the text.
+fn quick_connect_text(code: &str, login_expired: bool) -> String {
+    let usual = format!(
+        "Jellyfin Quick Connect code: {code}\nApprove it in another Jellyfin app under Settings → Quick Connect"
+    );
+    if login_expired {
+        format!("mpvfin: Jellyfin login expired\n{usual}")
+    } else {
+        usual
+    }
+}
+
 /// Logs in with Quick Connect: `(user id, token)`, or `None` when the server
 /// has it disabled or the session is stopping.
 fn quick_connect(
     client: &Client,
+    login_expired: bool,
     sink: &Sink,
     stop: &AtomicBool,
 ) -> Result<Option<(String, Secret)>, HttpError> {
@@ -376,9 +389,7 @@ fn quick_connect(
             return Err(HttpError::transport("Quick Connect reply has no code"));
         };
         log(sink, format!("Quick Connect code: {code}"));
-        let text = format!(
-            "Jellyfin Quick Connect code: {code}\nApprove it in another Jellyfin app under Settings → Quick Connect"
-        );
+        let text = quick_connect_text(code, login_expired);
         let poll = format!("/QuickConnect/Connect?secret={}", pct(secret));
         for tick in 1u32.. {
             if tick % 5 == 1 {
@@ -558,4 +569,19 @@ fn resolve(c: &Creds, item_id: &str) -> Result<ResolvedMedia, String> {
         )
         .map_err(failed)?;
     resolve_media(&c.media_base, item_id, &item, &info)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn expired_login_heads_the_quick_connect_osd() {
+        let usual = quick_connect_text("123456", false);
+        assert!(usual.starts_with("Jellyfin Quick Connect code: 123456\n"));
+        assert_eq!(
+            quick_connect_text("123456", true),
+            format!("mpvfin: Jellyfin login expired\n{usual}")
+        );
+    }
 }

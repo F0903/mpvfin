@@ -85,10 +85,6 @@ pub fn queue_commands(req: &QueueRequest) -> Vec<Vec<String>> {
 pub fn hook_properties(media: &ResolvedMedia) -> Vec<(&'static str, String)> {
     vec![
         ("stream-open-filename", media.uri.clone()),
-        (
-            "file-local-options/http-header-fields",
-            media.auth_header.expose().to_owned(),
-        ),
         ("file-local-options/force-media-title", media.title.clone()),
         ("file-local-options/save-position-on-quit", "no".to_owned()),
     ]
@@ -157,7 +153,7 @@ mod tests {
     use crate::ffi::{
         MPV_END_FILE_REASON_QUIT, MPV_END_FILE_REASON_REDIRECT, MPV_END_FILE_REASON_STOP,
     };
-    use mpvfin_core::{PlayMethod, Secret, TrackMap};
+    use mpvfin_core::{PlayMethod, TrackMap};
 
     fn cmd(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|s| (*s).to_owned()).collect()
@@ -181,7 +177,6 @@ mod tests {
             play_session_id: "ps".into(),
             media_source_id: "ms".into(),
             play_method: PlayMethod::DirectPlay,
-            auth_header: Secret::new("Authorization: MediaBrowser Token=\"tok\"".into()),
             external_subtitles: vec!["https://jf.invalid/abc/Subtitles/0/Stream.srt".into()],
             tracks: TrackMap {
                 audio: vec![1, 2],
@@ -295,17 +290,14 @@ mod tests {
     }
 
     #[test]
-    fn hook_sets_stream_header_title_and_disables_watch_later() {
+    fn hook_sets_stream_title_and_disables_watch_later() {
+        let properties = hook_properties(&media());
         assert_eq!(
-            hook_properties(&media()),
+            properties,
             vec![
                 (
                     "stream-open-filename",
                     "https://jf.invalid/Videos/abc/stream?static=true".to_owned()
-                ),
-                (
-                    "file-local-options/http-header-fields",
-                    "Authorization: MediaBrowser Token=\"tok\"".to_owned()
                 ),
                 (
                     "file-local-options/force-media-title",
@@ -313,6 +305,11 @@ mod tests {
                 ),
                 ("file-local-options/save-position-on-quit", "no".to_owned()),
             ]
+        );
+        assert!(
+            properties
+                .iter()
+                .all(|(name, _)| !name.contains("http-header-fields"))
         );
     }
 

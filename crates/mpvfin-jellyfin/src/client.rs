@@ -88,6 +88,13 @@ pub fn reconnect_delay(attempt: u32, jitter: f64) -> Duration {
         .mul_f64(0.75 + 0.5 * jitter.clamp(0.0, 1.0))
 }
 
+/// TLS settings shared by every HTTP agent.
+pub(crate) fn tls_config() -> TlsConfig {
+    TlsConfig::builder()
+        .root_certs(RootCerts::PlatformVerifier)
+        .build()
+}
+
 /// REST client for one server and one `Authorization` header value.
 #[derive(Clone)] // no Debug: the header carries the token
 pub struct Client {
@@ -103,11 +110,7 @@ impl Client {
         let agent = Agent::config_builder()
             .timeout_connect(Some(Duration::from_secs(5)))
             .timeout_global(Some(Duration::from_secs(10)))
-            .tls_config(
-                TlsConfig::builder()
-                    .root_certs(RootCerts::PlatformVerifier)
-                    .build(),
-            )
+            .tls_config(tls_config())
             .build()
             .into();
         Self { agent, base, auth }

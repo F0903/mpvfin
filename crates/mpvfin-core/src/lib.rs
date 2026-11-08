@@ -173,8 +173,6 @@ pub struct ResolvedMedia {
     pub media_source_id: String,
     /// Delivery method selected by Jellyfin.
     pub play_method: PlayMethod,
-    /// Full header line: `Authorization: MediaBrowser Token="..."`.
-    pub auth_header: Secret,
     /// Credential-free external subtitle URLs, after the embedded subtitles.
     pub external_subtitles: Vec<String>,
     /// Jellyfin/mpv track correspondence.
@@ -878,7 +876,6 @@ mod tests {
             play_session_id: format!("session-{item_id}"),
             media_source_id: format!("source-{item_id}"),
             play_method: PlayMethod::DirectPlay,
-            auth_header: Secret::new("Authorization: MediaBrowser Token=\"tok\"".to_owned()),
             external_subtitles: Vec::new(),
             tracks: TrackMap::default(),
         }

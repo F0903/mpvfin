@@ -19,9 +19,10 @@ use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{Message, WebSocket};
 
 use crate::client::{Client, HttpError, reconnect_delay, sanitize};
-use crate::config::parse_config;
-use crate::identity::{auth_header, device_name, media_auth_header, pct};
+use crate::config::{BaseUrl, parse_config};
+use crate::identity::{auth_header, device_name, pct};
 use crate::negotiate::{capabilities_body, playback_info_body, resolve_media};
+use crate::proxy::{Proxy, TokenSource};
 use crate::report::{progress_body, started_body, stopped_body};
 use crate::state::{LockError, State, StateFile};
 use crate::wire::{Inbound, parse_inbound};
@@ -123,7 +124,10 @@ impl SessionHandle {
 struct Creds {
     client: Client,
     user_id: String,
-    token: Secret,
+    /// The `Authorization` value the media proxy sends upstream.
+    auth: Secret,
+    /// The media proxy; every URL given to mpv goes through it.
+    media_base: BaseUrl,
 }
 
 /// Starts the supervisor and job threads and returns at once.
@@ -212,7 +216,7 @@ fn save(file: &mut StateFile, state: &State, sink: &Sink) {
     }
 }
 
-fn supervise(paths: &Paths, sink: &Sink, stop: &AtomicBool, creds: &Mutex<Option<Creds>>) {
+fn supervise(paths: &Paths, sink: &Sink, stop: &AtomicBool, creds: &Arc<Mutex<Option<Creds>>>) {
     let config = fs::read_to_string(&paths.config_file)
         .map_err(|e| e.to_string())
         .and_then(|text| parse_config(&text));
@@ -234,6 +238,15 @@ fn supervise(paths: &Paths, sink: &Sink, stop: &AtomicBool, creds: &Mutex<Option
         state.user_id = None;
     }
     save(&mut file, &state, sink); // persists a freshly minted device id
+    // Lives as long as this function; dropping it on any way out stops it.
+    let proxy = match start_proxy(&base, creds) {
+        Ok(proxy) => proxy,
+        Err(e) => {
+            log(sink, format!("cannot start the media proxy: {e}"));
+            osd(sink, "mpvfin: cannot start the media proxy", 5);
+            return;
+        }
+    };
     let name = device_name();
     let mut attempt = 0;
     'session: loop {
@@ -257,7 +270,7 @@ fn supervise(paths: &Paths, sink: &Sink, stop: &AtomicBool, creds: &Mutex<Option
                 }
             };
             let auth = auth_header(&name, &state.device_id, Some(&token));
-            let client = Client::new(base.clone(), auth);
+            let client = Client::new(base.clone(), auth.clone());
             match client.post("/Sessions/Capabilities/Full", &capabilities_body()) {
                 Ok(_) => {}
                 Err(HttpError::Unauthorized) => {
@@ -279,7 +292,8 @@ fn supervise(paths: &Paths, sink: &Sink, stop: &AtomicBool, creds: &Mutex<Option
                 Some(Creds {
                     client,
                     user_id,
-                    token,
+                    auth,
+                    media_base: proxy.base().clone(),
                 }),
             );
             if stop.load(Ordering::Relaxed) {
@@ -303,6 +317,16 @@ fn supervise(paths: &Paths, sink: &Sink, stop: &AtomicBool, creds: &Mutex<Option
             return;
         }
     }
+}
+
+/// Starts the media proxy; it always sends the current login's header.
+fn start_proxy(base: &BaseUrl, creds: &Arc<Mutex<Option<Creds>>>) -> io::Result<Proxy> {
+    let creds = creds.clone();
+    let auth: TokenSource = Arc::new(move || {
+        let current = creds.lock().unwrap_or_else(PoisonError::into_inner);
+        current.as_ref().map(|c| c.auth.clone())
+    });
+    Proxy::start(base.clone(), auth)
 }
 
 /// Takes the state file lock, waiting while another window holds it.
@@ -532,11 +556,5 @@ fn resolve(c: &Creds, item_id: &str) -> Result<ResolvedMedia, String> {
             &playback_info_body(&c.user_id),
         )
         .map_err(failed)?;
-    resolve_media(
-        c.client.base(),
-        item_id,
-        &item,
-        &info,
-        media_auth_header(&c.token),
-    )
+    resolve_media(&c.media_base, item_id, &item, &info)
 }

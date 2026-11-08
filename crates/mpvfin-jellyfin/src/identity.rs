@@ -1,4 +1,4 @@
-//! Client identity and the `Authorization` header values.
+//! Client identity and the `Authorization` header value.
 
 use std::fmt::Write as _;
 use std::hash::{BuildHasher, Hasher};
@@ -61,15 +61,6 @@ pub fn auth_header(device_name: &str, device_id: &str, token: Option<&Secret>) -
     Secret::new(v)
 }
 
-/// The full header line sent to media endpoints.
-#[must_use]
-pub fn media_auth_header(token: &Secret) -> Secret {
-    Secret::new(format!(
-        "Authorization: MediaBrowser Token=\"{}\"",
-        pct(token.expose())
-    ))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -83,12 +74,6 @@ mod tests {
         let h = auth_header("n", "id", Some(&t));
         assert!(h.expose().ends_with(", Token=\"tok\""));
         assert!(h.expose().starts_with("MediaBrowser Client=\"mpvfin\", Device=\"n\""));
-    }
-
-    #[test]
-    fn media_auth_header_has_token_only() {
-        let h = media_auth_header(&Secret::new("tok".into()));
-        assert_eq!(h.expose(), "Authorization: MediaBrowser Token=\"tok\"");
     }
 
     #[test]

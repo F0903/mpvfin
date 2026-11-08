@@ -62,8 +62,8 @@ require opening, transcodes, and incompatible media with a clear diagnostic.
 
 Retain the returned play-session ID, media-source ID, play method, stream
 indices, ETag, and required HTTP headers. Do not pass a server-local
-`MediaSource.Path` to mpv. Construct an authenticated server streaming URL for
-normal server-hosted files. Redact that URL wherever it may contain an API key.
+`MediaSource.Path` to mpv. Hand mpv only local proxy URLs (see "Local auth
+proxy" below), never a token in a URL, header or property.
 
 Jellyfin positions use 100-nanosecond ticks. Convert at the transport boundary;
 the reducer and mpv port use `Duration`.
@@ -138,7 +138,25 @@ verified against that image, all unauthenticated until login:
   It does carry the API key, so mpvfin strips every `ApiKey`/`api_key`
   parameter before handing the URL to mpv.
 - Stream URL: `{base}/Videos/{itemId}/stream?static=true&mediaSourceId={sourceId}`,
-  authenticated by the `Authorization` header only.
+  authenticated by the `Authorization` header only. mpvfin requests it through
+  the local proxy.
+
+## Local auth proxy
+
+mpv logs every property set at `-v` and command arguments at `debug`, so it
+must never hold the token. `mpvfin-jellyfin` runs a proxy on
+`http://127.0.0.1:<port>/<random 32 hex>` and builds every stream and subtitle
+URL on that base; the `Authorization` header is added upstream.
+
+- Only `GET` and `HEAD` under `/<secret>/Videos/` are served, and `..` is
+  refused raw or percent-encoded. Other paths answer 403, so a leaked link
+  cannot reach the rest of the API. A wrong secret answers 404.
+- Responses carry only `Content-Type`, `Content-Length`, `Content-Range` and
+  `Accept-Ranges`, plus `Connection: close`. Upstream `200`, `206`, `404` and
+  `416` pass through; anything else becomes `502` with an empty body. A
+  logged-out session answers `503` without contacting the server.
+- Upstream requests use a 5 s connect timeout and a 30 s per-read timeout, no
+  overall limit, zero redirects, and `Accept-Encoding: identity`.
 
 ## Quick Connect login (verified against the test server)
 

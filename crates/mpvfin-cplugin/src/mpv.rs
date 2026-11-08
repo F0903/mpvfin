@@ -132,7 +132,7 @@ impl Mpv {
     /// # Errors
     ///
     /// Names the property and why mpv rejected it. Never contains `value`,
-    /// which may be the auth header.
+    /// which may be a proxy URL carrying its path secret.
     pub fn set_property(&self, name: &str, value: &str) -> Result<(), String> {
         let result = c_string(name).and_then(|c_name| {
             let c_value = c_string(value)?;

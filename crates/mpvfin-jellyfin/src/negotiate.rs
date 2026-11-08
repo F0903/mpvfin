@@ -1,6 +1,6 @@
 //! Capabilities and direct-play negotiation bodies, and `PlaybackInfo` parsing.
 
-use mpvfin_core::{PlayMethod, ResolvedMedia, Secret, TrackMap};
+use mpvfin_core::{PlayMethod, ResolvedMedia, TrackMap};
 use serde_json::{Value, json};
 
 use crate::config::BaseUrl;
@@ -99,7 +99,6 @@ pub fn resolve_media(
     item_id: &str,
     item: &Value,
     playback_info: &Value,
-    auth_header: Secret,
 ) -> Result<ResolvedMedia, String> {
     if let Some(code) = playback_info.get("ErrorCode").filter(|c| !c.is_null()) {
         let code = code
@@ -171,7 +170,6 @@ pub fn resolve_media(
         play_session_id: play_session_id.to_owned(),
         media_source_id: source_id.to_owned(),
         play_method: PlayMethod::DirectPlay,
-        auth_header,
         external_subtitles,
         tracks: TrackMap { audio, subtitles },
     })
@@ -186,13 +184,7 @@ mod tests {
     }
 
     fn resolve(info: &Value) -> Result<ResolvedMedia, String> {
-        resolve_media(
-            &base(),
-            "item1",
-            &json!({"Name": "N"}),
-            info,
-            Secret::new("H".into()),
-        )
+        resolve_media(&base(), "item1", &json!({"Name": "N"}), info)
     }
 
     fn info(source: &Value) -> Value {

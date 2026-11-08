@@ -524,8 +524,13 @@ impl Receiver {
                 };
                 actions.push(ReceiverAction::QueueItems(request));
             }
-            ReceiverEvent::RemoteNext => actions.push(ReceiverAction::PlaylistNext),
-            ReceiverEvent::RemotePrevious => actions.push(ReceiverAction::PlaylistPrevious),
+            ReceiverEvent::RemoteNext if self.current_generation().is_some() => {
+                actions.push(ReceiverAction::PlaylistNext);
+            }
+            ReceiverEvent::RemotePrevious if self.current_generation().is_some() => {
+                actions.push(ReceiverAction::PlaylistPrevious);
+            }
+            ReceiverEvent::RemoteNext | ReceiverEvent::RemotePrevious => {}
             ReceiverEvent::PlayerOpening { token, item_id } => {
                 self.terminate_current(StopReason::Stopped, &mut actions);
                 let generation = self.allocate_generation();
@@ -1279,6 +1284,10 @@ mod tests {
             r.handle(ReceiverEvent::RemoteSetSubtitleStream(1))
                 .is_empty()
         );
+        // Idle: a phone must not skip through a local playlist.
+        assert!(r.handle(ReceiverEvent::RemoteNext).is_empty());
+        assert!(r.handle(ReceiverEvent::RemotePrevious).is_empty());
+        begin_playing(&mut r, "a", 70);
         assert_eq!(
             r.handle(ReceiverEvent::RemoteNext),
             vec![ReceiverAction::PlaylistNext]

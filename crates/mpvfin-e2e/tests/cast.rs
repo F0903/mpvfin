@@ -394,7 +394,8 @@ fn second_window_stays_dormant_until_first_closes() {
     let second = Player::launch(opts);
 
     second.wait_log("another mpv window is the Jellyfin cast target", T20);
-    std::thread::sleep(secs(3));
+    // Longer than the 5 s lock retry, so a retry that wrongly succeeds is seen.
+    std::thread::sleep(secs(6));
     assert!(
         !second.log_text().contains("connected to Jellyfin"),
         "second window connected while the first was alive"
@@ -423,6 +424,11 @@ fn mpv_stays_responsive_and_quits_when_server_unreachable() {
     });
 
     std::thread::sleep(secs(2));
+    player.wait_log("[mpvfin] loaded", T10);
+    assert!(
+        !player.log_text().contains("no server configured"),
+        "the plugin never got as far as the unreachable server"
+    );
     let started = Instant::now();
     assert_eq!(player.get("pause"), json!(false));
     let answered = started.elapsed();

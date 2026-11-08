@@ -16,7 +16,10 @@ pub struct Config {
 /// # Errors
 /// Returns a message when `server` is missing or not an http(s) URL.
 pub fn parse_config(text: &str) -> Result<Config, String> {
+    // Windows editors may save the file with a byte order mark.
     let server = text
+        .strip_prefix('\u{feff}')
+        .unwrap_or(text)
         .lines()
         .map(str::trim)
         .filter(|l| !l.starts_with('#'))
@@ -80,6 +83,12 @@ mod tests {
     fn parses_server_from_script_opts() {
         let c = parse_config("# c\n server = https://h/jf/ \nother=1").unwrap();
         assert_eq!(c.server.as_str(), "https://h/jf");
+    }
+
+    #[test]
+    fn leading_byte_order_mark_is_ignored() {
+        let c = parse_config("\u{feff}server=https://h\n").unwrap();
+        assert_eq!(c.server.as_str(), "https://h");
     }
 
     #[test]

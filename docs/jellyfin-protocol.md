@@ -60,8 +60,9 @@ parameters and the registered device profile in the JSON body. The first
 implementation enables direct play only and rejects live sources, sources that
 require opening, transcodes, and incompatible media with a clear diagnostic.
 
-Retain the returned play-session ID, media-source ID, play method, stream
-indices, ETag, and required HTTP headers. Do not pass a server-local
+Retain the returned play-session ID, media-source ID, play method and stream
+indices; the ETag and required HTTP headers are not retained. Do not pass a
+server-local
 `MediaSource.Path` to mpv. Hand mpv only local proxy URLs (see "Local auth
 proxy" below), never a token in a URL, header or property.
 

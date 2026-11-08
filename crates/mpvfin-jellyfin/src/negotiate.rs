@@ -264,6 +264,19 @@ mod tests {
     }
 
     #[test]
+    fn delivery_url_on_a_prefixed_base_keeps_exactly_one_prefix() {
+        let s = source(&json!([
+            {"Index": 5, "Type": "Subtitle", "IsExternal": true, "DeliveryUrl": "/Videos/x/Stream.srt"}
+        ]));
+        let prefixed = BaseUrl::parse("https://h/jf/").unwrap();
+        let m = resolve_media(&prefixed, "item1", &json!({"Name": "N"}), &info(&s)).unwrap();
+        assert_eq!(
+            m.external_subtitles,
+            vec!["https://h/jf/Videos/x/Stream.srt"]
+        );
+    }
+
+    #[test]
     fn delivery_url_credentials_are_stripped() {
         for key in ["ApiKey", "api_key", "APIKEY"] {
             let url = format!("/Videos/x/y/Subtitles/5/0/Stream.srt?{key}=SECRET&foo=1");

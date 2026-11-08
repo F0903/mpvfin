@@ -20,7 +20,8 @@ reported back too.
 Direct play only; items mpv cannot direct-play fail with an OSD message. The
 skip button and watch together are not built yet.
 
-It needs an mpv built with C-plugin support. Windows is the tested platform.
+It needs mpv 0.38 or newer (for `loadfile url flags index options`), built
+with C-plugin support. Windows is the tested platform.
 
 ## Install
 

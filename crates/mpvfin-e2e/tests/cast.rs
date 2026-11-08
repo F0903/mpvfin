@@ -328,6 +328,8 @@ fn config_dir_untouched_and_token_absent_from_log() {
 
     let player = Player::launch(opts);
     let session = connected_session(&server, &player, &device);
+    // A per-file override applies after load, so the user's setting shows here.
+    assert_eq!(player.get("save-position-on-quit"), json!(true));
     let e01 = server.episodes()[0].0.clone();
     server.play(&session, &[&e01], 0, Duration::ZERO);
     poll_until(T20, || {
@@ -345,14 +347,14 @@ fn config_dir_untouched_and_token_absent_from_log() {
             .any(|t| t["type"] == "sub" && t["external"] == true),
         "external subtitle not loaded: {tracks}"
     );
-    let (_, log) = player.quit_with_log();
+    let (quit, log) = player.quit_watch_later();
 
-    assert_eq!(before, snapshot(dir.path()), "config dir changed");
-    let watch_later = dir.path().join("watch_later");
+    assert!(quit < secs(5), "quit-watch-later took {quit:?}");
     assert!(
-        !watch_later.exists() || fs::read_dir(&watch_later).unwrap().next().is_none(),
+        !dir.path().join("watch_later").exists(),
         "watch_later was written"
     );
+    assert_eq!(before, snapshot(dir.path()), "config dir changed");
 
     assert!(log.contains("Stream.subrip"), "log is too short to judge");
     let lower = log.to_ascii_lowercase();

@@ -466,10 +466,19 @@ impl Player {
     }
 
     /// `quit`, plus the whole log, shutdown lines included.
-    pub fn quit_with_log(mut self) -> (Duration, String) {
+    pub fn quit_with_log(self) -> (Duration, String) {
+        self.quit_using("quit")
+    }
+
+    /// `quit_with_log`, but through `quit-watch-later`.
+    pub fn quit_watch_later(self) -> (Duration, String) {
+        self.quit_using("quit-watch-later")
+    }
+
+    fn quit_using(mut self, command: &str) -> (Duration, String) {
         let started = Instant::now();
         // mpv may close the pipe before replying, so the reply is not awaited.
-        drop(self.send(&[json!("quit")]));
+        drop(self.send(&[json!(command)]));
         while Instant::now() < started + QUIT_TIMEOUT {
             if self.child.try_wait().ok().flatten().is_some() {
                 return (started.elapsed(), self.log_text());

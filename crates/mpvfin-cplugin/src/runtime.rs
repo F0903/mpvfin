@@ -47,6 +47,8 @@ pub fn run(mpv: Mpv) -> c_int {
         config_file: path("~~/script-opts/mpvfin.conf"),
         state_file: path("~~/script-opts/mpvfin-state.json"),
     };
+    // Under a regular file, so mpv can never create it.
+    let watch_later_dir = paths.state_file.join("watch_later").display().to_string();
     let (tx, rx) = mpsc::channel();
     let waker = mpv.waker();
     let session = mpvfin_jellyfin::start(
@@ -65,6 +67,7 @@ pub fn run(mpv: Mpv) -> c_int {
         current: None,
         observed: Observed::default(),
         pending_resolve: None,
+        watch_later_dir,
     };
     runtime.event_loop();
     runtime.shutdown()
@@ -163,6 +166,7 @@ struct Runtime {
     current: Option<i64>,
     observed: Observed,
     pending_resolve: Option<PendingResolve>,
+    watch_later_dir: String,
 }
 
 /// The latest `ResolveMedia`, until the job thread answers it.
@@ -440,7 +444,7 @@ impl Runtime {
                 media,
                 selection,
             } => {
-                for (name, value) in adapter::hook_properties(&media) {
+                for (name, value) in adapter::hook_properties(&media, &self.watch_later_dir) {
                     self.set(name, &value);
                 }
                 if let Some(entry) = self

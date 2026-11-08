@@ -81,12 +81,22 @@ pub fn queue_commands(req: &QueueRequest) -> Vec<Vec<String>> {
 }
 
 /// Properties the `on_load` hook sets before continuing an mpvfin entry.
+///
+/// `watch_later_dir` must be a path mpv cannot create: `quit-watch-later`
+/// ignores `save-position-on-quit`, so only a failing write keeps it out.
 #[must_use]
-pub fn hook_properties(media: &ResolvedMedia) -> Vec<(&'static str, String)> {
+pub fn hook_properties(
+    media: &ResolvedMedia,
+    watch_later_dir: &str,
+) -> Vec<(&'static str, String)> {
     vec![
         ("stream-open-filename", media.uri.clone()),
         ("file-local-options/force-media-title", media.title.clone()),
         ("file-local-options/save-position-on-quit", "no".to_owned()),
+        (
+            "file-local-options/watch-later-dir",
+            watch_later_dir.to_owned(),
+        ),
     ]
 }
 
@@ -291,7 +301,7 @@ mod tests {
 
     #[test]
     fn hook_sets_stream_title_and_disables_watch_later() {
-        let properties = hook_properties(&media());
+        let properties = hook_properties(&media(), "state.json/watch_later");
         assert_eq!(
             properties,
             vec![
@@ -304,6 +314,10 @@ mod tests {
                     "Test Show - S01E01".to_owned()
                 ),
                 ("file-local-options/save-position-on-quit", "no".to_owned()),
+                (
+                    "file-local-options/watch-later-dir",
+                    "state.json/watch_later".to_owned()
+                ),
             ]
         );
         assert!(

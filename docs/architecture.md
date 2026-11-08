@@ -63,8 +63,10 @@ so mpv's own playlist is the queue and the user's next/previous keys work.
 3. The reducer issues `ResolveMedia`. The `jobs` thread calls `PlaybackInfo`
    off mpv's event path and answers with `MediaResolved` or
    `MediaResolutionFailed`.
-4. `ContinueLoad` sets `stream-open-filename` to the proxy URL, and the title
-   and `save-position-on-quit=no` file-locally, then continues the hook. Every
+4. `ContinueLoad` sets `stream-open-filename` to the proxy URL, and the title,
+   `save-position-on-quit=no` and an uncreatable `watch-later-dir` (a path
+   under the state file) file-locally, then continues the hook, so mpv records
+   no resume data for Jellyfin items, not even on `quit-watch-later`. Every
    hook is continued exactly once; `Mpv` rejects unknown or repeated ids.
 5. On `file-loaded` the plugin adds external subtitles and applies the
    selected tracks, then reports start. Pause, seek, volume, mute and track

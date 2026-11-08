@@ -43,9 +43,12 @@ plugin talks to mpv.
 
 Session threads pass `SessionEvent`s over a channel and call `mpv_wakeup`
 through a `Waker`, which interrupts the plugin thread's wait. The `Waker` is
-disarmed before mpv's handle goes away. On shutdown the plugin thread continues
-any held hook, queues the final stop report, and gives the session a bounded
-two-second flush.
+disarmed before mpv's handle goes away. mpv sends its shutdown event only after
+every hook has continued, so the plugin thread fails a resolve still unanswered
+after four seconds; that bounds quitting while the server stalls. On shutdown
+it queues the final stop report and gives the session a bounded two-second
+flush, or none if a resolve is stuck past that deadline, since jobs run in
+order and no report can be waiting behind it.
 
 ## Playback flow
 

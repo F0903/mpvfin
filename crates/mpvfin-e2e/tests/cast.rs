@@ -7,7 +7,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use mpvfin_e2e::{
-    Player, PlayerOptions, Server, State, TempDir, poll_until, reported_position, write_config,
+    Player, PlayerOptions, Server, StallingServer, State, TempDir, poll_until, reported_position,
+    write_config,
 };
 use serde_json::{Value, json};
 
@@ -389,6 +390,28 @@ fn mpv_stays_responsive_and_quits_when_server_unreachable() {
     assert_eq!(player.get("pause"), json!(false));
     let answered = started.elapsed();
     assert!(answered < secs(1), "IPC answered in {answered:?}");
+
+    let quit = player.quit();
+    assert!(quit < secs(5), "quit took {quit:?}");
+}
+
+#[test]
+#[ignore = "needs ./scripts/test-server.ps1 -Action up"]
+fn quit_is_bounded_while_resolve_stalls() {
+    let stub = StallingServer::start("stalled-item");
+    let player = Player::launch(PlayerOptions {
+        server: stub.url().to_owned(),
+        state: State {
+            device_id: fresh_id(),
+            server: Some(stub.url().to_owned()),
+            user_id: Some("user".to_owned()),
+            access_token: Some("token".to_owned()),
+        },
+        mpv_conf: String::new(),
+        config_dir: None,
+    });
+    player.wait_log("connected to Jellyfin", T20);
+    poll_until(T20, || stub.item_requested().then_some(()));
 
     let quit = player.quit();
     assert!(quit < secs(5), "quit took {quit:?}");

@@ -24,6 +24,10 @@ use crate::mpv::{Mpv, from_c};
 /// Interval of the reducer's progress tick.
 const TICK: Duration = Duration::from_secs(10);
 
+/// How long a resolve may hold mpv's load hook. mpv cannot quit until the hook
+/// continues, so this bounds quitting while the server stalls.
+const RESOLVE_DEADLINE: Duration = Duration::from_secs(4);
+
 /// Runs the plugin until mpv shuts down; the entry point's return value.
 pub fn run(mpv: Mpv) -> c_int {
     mpv.log("loaded");
@@ -60,6 +64,7 @@ pub fn run(mpv: Mpv) -> c_int {
         entries: HashMap::new(),
         current: None,
         observed: Observed::default(),
+        pending_resolve: None,
     };
     runtime.event_loop();
     runtime.shutdown()
@@ -157,13 +162,25 @@ struct Runtime {
     /// Entry id of the latest `START_FILE`.
     current: Option<i64>,
     observed: Observed,
+    pending_resolve: Option<PendingResolve>,
+}
+
+/// The latest `ResolveMedia`, until the job thread answers it.
+struct PendingResolve {
+    generation: Generation,
+    deadline: Instant,
+    expired: bool,
 }
 
 impl Runtime {
     fn event_loop(&mut self) {
         let mut next_tick = Instant::now() + TICK;
         loop {
-            let timeout = next_tick.saturating_duration_since(Instant::now());
+            let wake = match &self.pending_resolve {
+                Some(pending) if !pending.expired => pending.deadline.min(next_tick),
+                _ => next_tick,
+            };
+            let timeout = wake.saturating_duration_since(Instant::now());
             let Some(event) = self.mpv.wait_event(timeout.as_secs_f64()).map(Event::read) else {
                 self.mpv.log("mpv_wait_event returned no event");
                 return;
@@ -200,6 +217,7 @@ impl Runtime {
                 Event::Other => {}
             }
             self.drain();
+            self.expire_resolve();
             if Instant::now() >= next_tick {
                 next_tick = Instant::now() + TICK;
                 self.feed(ReceiverEvent::ProgressTick);
@@ -207,12 +225,20 @@ impl Runtime {
         }
     }
 
-    /// Feed `Shutdown` first: it continues a held hook, without which mpv
-    /// cannot finish quitting, and queues the final stop report.
+    /// mpv sends SHUTDOWN only after every hook continued, so none is held
+    /// here (`RESOLVE_DEADLINE` bounds that wait); this queues the final stop report.
     fn shutdown(mut self) -> c_int {
         self.feed(ReceiverEvent::Shutdown);
         self.mpv.waker().disarm();
-        self.session.shutdown(Duration::from_secs(2));
+        // Jobs run in order and playback needs its resolve answered, so behind
+        // a resolve stuck past its deadline there is no report to wait for.
+        let stalled = self.pending_resolve.as_ref().is_some_and(|p| p.expired);
+        let flush = if stalled {
+            Duration::ZERO
+        } else {
+            Duration::from_secs(2)
+        };
+        self.session.shutdown(flush);
         // Log lines from the final flush; any other event is too late to act on.
         for event in self.rx.try_iter() {
             if let SessionEvent::Log(line) = event {
@@ -220,6 +246,20 @@ impl Runtime {
             }
         }
         0
+    }
+
+    fn expire_resolve(&mut self) {
+        let Some(pending) = &mut self.pending_resolve else {
+            return;
+        };
+        if !pending.expired && Instant::now() >= pending.deadline {
+            pending.expired = true;
+            let generation = pending.generation;
+            self.feed(ReceiverEvent::MediaResolutionFailed {
+                generation,
+                message: "Jellyfin took too long to respond".to_owned(),
+            });
+        }
     }
 
     fn on_load(&mut self, hook_id: u64) {
@@ -341,7 +381,18 @@ impl Runtime {
     fn drain(&mut self) {
         while let Ok(event) = self.rx.try_recv() {
             match event {
-                SessionEvent::Receiver(event) => self.feed(event),
+                SessionEvent::Receiver(event) => {
+                    if let ReceiverEvent::MediaResolved { generation, .. }
+                    | ReceiverEvent::MediaResolutionFailed { generation, .. } = &event
+                        && self
+                            .pending_resolve
+                            .as_ref()
+                            .is_some_and(|p| p.generation == *generation)
+                    {
+                        self.pending_resolve = None;
+                    }
+                    self.feed(event);
+                }
                 SessionEvent::Osd { text, duration } => self.mpv.show_text(&text, duration),
                 SessionEvent::Log(line) => self.mpv.log(&line),
             }
@@ -373,6 +424,11 @@ impl Runtime {
                     media: None,
                 };
                 self.entries.insert(token.entry_id, entry);
+                self.pending_resolve = Some(PendingResolve {
+                    generation,
+                    deadline: Instant::now() + RESOLVE_DEADLINE,
+                    expired: false,
+                });
                 self.session.submit(Job::Resolve {
                     generation,
                     item_id,

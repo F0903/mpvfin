@@ -8,10 +8,12 @@
 )]
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -194,6 +196,81 @@ impl Server {
             .expect("MediaStreams")
             .clone()
     }
+}
+
+/// A stand-in Jellyfin that accepts the plugin, casts one item over the
+/// WebSocket and never answers `/Items/{id}`, so mpv's load hook stays held.
+pub struct StallingServer {
+    url: String,
+    item_requested: Arc<AtomicBool>,
+}
+
+impl StallingServer {
+    pub fn start(item: &str) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind stub server");
+        let url = format!("http://{}", listener.local_addr().expect("stub address"));
+        let item_requested = Arc::new(AtomicBool::new(false));
+        let (item, requested) = (item.to_owned(), item_requested.clone());
+        thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let (item, requested) = (item.clone(), requested.clone());
+                thread::spawn(move || stub_connection(stream, &item, &requested));
+            }
+        });
+        Self {
+            url,
+            item_requested,
+        }
+    }
+
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+
+    /// Whether the plugin has asked for the item, which it does with the hook held.
+    pub fn item_requested(&self) -> bool {
+        self.item_requested.load(Ordering::SeqCst)
+    }
+}
+
+fn stub_connection(stream: TcpStream, item: &str, requested: &AtomicBool) {
+    let mut start = [0; 16];
+    let Ok(seen) = stream.peek(&mut start) else {
+        return;
+    };
+    if start[..seen].starts_with(b"GET /socket") {
+        let mut socket = tungstenite::accept(stream).expect("stub WebSocket handshake");
+        let play = json!({"MessageType": "Play", "Data": {"ItemIds": [item], "PlayCommand": "PlayNow"}});
+        socket
+            .send(tungstenite::Message::text(play.to_string()))
+            .expect("stub Play message");
+        while socket.read().is_ok() {}
+        return;
+    }
+    let mut reader = BufReader::new(&stream);
+    let mut request = String::new();
+    let _ = reader.read_line(&mut request);
+    let mut body_length = 0;
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line).unwrap_or(0) == 0 || line.trim().is_empty() {
+            break;
+        }
+        if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+            body_length = value.trim().parse().unwrap_or(0);
+        }
+    }
+    let _ = reader.read_exact(&mut vec![0; body_length]);
+    if request.contains(" /Items/") {
+        requested.store(true, Ordering::SeqCst);
+        loop {
+            thread::park(); // keeps the connection open and unanswered
+        }
+    }
+    let _ = (&stream).write_all(b"HTTP/1.1 204 No Content
+Connection: close
+
+");
 }
 
 fn header(device_id: &str, token: Option<&str>) -> String {

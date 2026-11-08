@@ -113,7 +113,7 @@ impl SessionHandle {
         drop(jobs); // the worker exits once the queue is empty
         let _ = worker_done.recv_timeout(flush);
         stop.store(true, Ordering::Relaxed); // also makes the worker drop what is left
-        // Unused flush time goes to the socket close (reads wake every second).
+        // Unused flush time goes to the socket close (reads wake every 250 ms).
         let budget = flush.saturating_add(Duration::from_secs(1));
         let _ = supervisor_done.recv_timeout(budget.saturating_sub(started.elapsed()));
     }
@@ -459,7 +459,8 @@ fn open(url: &Secret) -> Result<Socket, String> {
         MaybeTlsStream::Rustls(tls) => tls.get_ref(),
         _ => return Err("unsupported WebSocket stream".into()),
     };
-    tcp.set_read_timeout(Some(Duration::from_secs(1)))
+    // Short, because a quit with a stalled resolve only has the rest of its bound for this.
+    tcp.set_read_timeout(Some(Duration::from_millis(250)))
         .map_err(clean)?;
     Ok(socket)
 }

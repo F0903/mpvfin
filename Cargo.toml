@@ -1,0 +1,20 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/mpvfin-core",
+    "crates/mpvfin-mpv",
+    "crates/mpvfin-cplugin",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+all = "warn"
+pedantic = "warn"
+

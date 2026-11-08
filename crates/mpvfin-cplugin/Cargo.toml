@@ -1,0 +1,14 @@
+[package]
+name = "mpvfin-cplugin"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lib]
+name = "mpvfin"
+crate-type = ["cdylib"]
+
+[lints]
+workspace = true
+

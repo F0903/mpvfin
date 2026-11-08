@@ -1,0 +1,13 @@
+[package]
+name = "mpvfin-mpv"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+mpvfin-core = { path = "../mpvfin-core" }
+
+[lints]
+workspace = true
+

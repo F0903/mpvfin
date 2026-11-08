@@ -5,6 +5,8 @@ use std::time::Duration;
 use mpvfin_core::{QueueMode, QueueRequest, ReceiverEvent, StreamSelection};
 use serde_json::Value;
 
+use crate::syncplay::{GroupUpdate, parse_group_message};
+
 /// What an inbound WebSocket text frame means to the receiver.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Inbound {
@@ -19,6 +21,8 @@ pub enum Inbound {
     },
     /// The server's keep-alive interval.
     ForceKeepAlive(Duration),
+    /// A `SyncPlay` command or group update.
+    Group(GroupUpdate),
     /// Anything unknown, malformed or unsupported.
     Ignored,
 }
@@ -155,6 +159,9 @@ pub fn parse_inbound(text: &str) -> Inbound {
         Some("ForceKeepAlive") => data
             .as_u64()
             .map(|s| Inbound::ForceKeepAlive(Duration::from_secs(s))),
+        Some(t @ ("SyncPlayCommand" | "SyncPlayGroupUpdate")) => {
+            Some(Inbound::Group(parse_group_message(t, data)))
+        }
         _ => None,
     };
     parsed.unwrap_or(Inbound::Ignored)
@@ -192,6 +199,14 @@ mod tests {
             parse_inbound(&m),
             req(QueueMode::Replace, &["a", "b", "c"], 1, 30, sel)
         );
+    }
+
+    #[test]
+    fn routes_syncplay_messages_to_group() {
+        let m = r#"{"MessageType":"SyncPlayGroupUpdate","Data":{"GroupId":"g","Type":"GroupLeft","Data":"x"}}"#;
+        assert_eq!(parse_inbound(m), Inbound::Group(GroupUpdate::Left));
+        let m = r#"{"MessageType":"SyncPlayCommand","Data":{"Command":"Nope"}}"#;
+        assert_eq!(parse_inbound(m), Inbound::Group(GroupUpdate::Ignored));
     }
 
     #[test]

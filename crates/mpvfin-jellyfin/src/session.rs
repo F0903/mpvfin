@@ -504,7 +504,8 @@ fn listen(mut socket: Socket, sink: &Sink, stop: &AtomicBool) -> Result<(), Stri
                     sink(SessionEvent::Osd { text, duration });
                 }
                 Inbound::ForceKeepAlive(interval) => keepalive = interval / 2,
-                Inbound::Ignored => {}
+                // Task 3 wires group updates into the session.
+                Inbound::Group(_) | Inbound::Ignored => {}
             },
             Ok(_) => {}
             Err(tungstenite::Error::Io(e))

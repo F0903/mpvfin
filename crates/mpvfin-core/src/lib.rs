@@ -999,6 +999,163 @@ impl Receiver {
     }
 }
 
+/// One entry of a `SyncPlay` queue.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GroupEntry {
+    /// Library item id.
+    pub item_id: String,
+    /// The queue entry's own id, stable for its lifetime.
+    pub playlist_item_id: String,
+}
+
+/// Why the group's queue update was sent.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QueueReason {
+    /// A whole new queue.
+    NewPlaylist,
+    /// The current item was set.
+    SetCurrentItem,
+    /// Moved to the next item.
+    NextItem,
+    /// Moved to the previous item.
+    PreviousItem,
+    /// Items were removed.
+    RemoveItems,
+    /// Anything that does not change the playing item.
+    Other,
+}
+
+/// A group's play queue as the server last described it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GroupQueue {
+    /// Why it was sent.
+    pub reason: QueueReason,
+    /// Server time of the update, in ms since the Unix epoch.
+    pub last_update_ms: i64,
+    /// The queue in server order.
+    pub entries: Vec<GroupEntry>,
+    /// Index of the current entry, if any.
+    pub playing_index: Option<usize>,
+    /// Where to start (or the extrapolated position).
+    pub start_position: Duration,
+    /// Whether the group is playing.
+    pub is_playing: bool,
+}
+
+/// A group playback command.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GroupCommandKind {
+    /// Start playing.
+    Unpause,
+    /// Pause.
+    Pause,
+    /// Seek.
+    Seek,
+    /// Stop.
+    Stop,
+}
+
+/// A group playback command with its timing.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GroupCommand {
+    /// What to do.
+    pub kind: GroupCommandKind,
+    /// Entry it applies to; all zeros when none.
+    pub playlist_item_id: String,
+    /// Position at `When`.
+    pub position: Duration,
+    /// `When` minus server now at receipt; may be negative.
+    pub delay_ms: i64,
+}
+
+/// One group in the server's list.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GroupSummary {
+    /// Group id.
+    pub id: String,
+    /// Display name.
+    pub name: String,
+    /// Distinct participants.
+    pub members: usize,
+    /// Server state name.
+    pub state: String,
+}
+
+/// A request a member sends to the group.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum GroupRequest {
+    /// Create a group.
+    New {
+        /// Group name.
+        name: String,
+    },
+    /// Join a group.
+    Join {
+        /// Group id.
+        group_id: String,
+    },
+    /// Leave the group.
+    Leave,
+    /// Replace the queue.
+    SetNewQueue {
+        /// Items in order.
+        item_ids: Vec<String>,
+        /// Index to play.
+        index: usize,
+        /// Start position.
+        start: Duration,
+    },
+    /// Add to the queue.
+    Queue {
+        /// Items to add.
+        item_ids: Vec<String>,
+        /// Insert after the current item instead of at the end.
+        next: bool,
+    },
+    /// Jump to an entry.
+    SetPlaylistItem {
+        /// Entry id.
+        pid: String,
+    },
+    /// Advance from an entry.
+    NextItem {
+        /// Entry id.
+        pid: String,
+    },
+    /// Go back from an entry.
+    PreviousItem {
+        /// Entry id.
+        pid: String,
+    },
+    /// Resume the group.
+    Unpause,
+    /// Pause the group.
+    Pause,
+    /// Stop the group.
+    Stop,
+    /// Seek the group.
+    Seek {
+        /// Target position.
+        position: Duration,
+    },
+    /// Report ready at a position.
+    Ready {
+        /// Sampled position.
+        position: Duration,
+        /// Whether local playback is running.
+        is_playing: bool,
+        /// Entry id.
+        pid: String,
+    },
+    /// Report buffering at a position.
+    Buffering {
+        /// Sampled position.
+        position: Duration,
+        /// Entry id.
+        pid: String,
+    },
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

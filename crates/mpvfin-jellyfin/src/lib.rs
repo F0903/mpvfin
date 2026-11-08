@@ -10,6 +10,7 @@ pub mod report;
 pub mod segments;
 pub mod session;
 pub mod state;
+pub mod syncplay;
 pub mod wire;
 
 pub use config::{BaseUrl, Config, parse_config};
@@ -20,4 +21,8 @@ pub use report::{progress_body, started_body, stopped_body};
 pub use segments::{END_OF_FILE_TOLERANCE, parse_segments, segments_path};
 pub use session::{Job, Paths, Report, SessionEvent, SessionHandle, Sink, start};
 pub use state::{LockError, State, StateFile};
+pub use syncplay::{
+    GroupUpdate, ZERO_ID, clock_sample, format_utc, parse_group_message, parse_groups,
+    parse_utc_ms, request_path_and_body,
+};
 pub use wire::{Inbound, duration_to_ticks, parse_inbound, ticks_to_duration};

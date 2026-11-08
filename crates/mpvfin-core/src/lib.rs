@@ -1695,6 +1695,30 @@ mod tests {
     }
 
     #[test]
+    fn skipping_credits_lands_on_an_adjacent_segment_and_shows_its_button() {
+        let (mut r, g) = playing_with(vec![
+            seg(SegmentKind::Outro, 90, 110, false),
+            seg(SegmentKind::Preview, 110, 120, false),
+        ]);
+        assert_eq!(at(&mut r, g, 95), vec![show(g, SegmentKind::Outro)]);
+        assert_eq!(
+            r.handle(ReceiverEvent::SkipRequested),
+            vec![
+                ReceiverAction::MarkPlayed {
+                    generation: g,
+                    item_id: "a".into()
+                },
+                hide(g),
+                ReceiverAction::Seek {
+                    generation: g,
+                    position: Duration::from_secs(110)
+                }
+            ]
+        );
+        assert_eq!(at(&mut r, g, 110), vec![show(g, SegmentKind::Preview)]);
+    }
+
+    #[test]
     fn adjacent_segments_swap_the_button() {
         let (mut r, g) = playing_with(vec![
             seg(SegmentKind::Outro, 90, 110, false),

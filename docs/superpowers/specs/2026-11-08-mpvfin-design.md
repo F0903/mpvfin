@@ -153,13 +153,12 @@ In build order. Each step must be usable on its own before the next starts.
   exceptions are volume and mute, because a remote volume change is meant to
   change mpv's volume.
 - **Credentials leaking**: no access token in media URLs, logs, the OSD, mpv's
-  watch-later files or uosc's history. Media and subtitle requests carry auth
-  in a per-file HTTP header (mpv's `http-header-fields`), not in an
-  `api_key` URL parameter. Set the header from an `on_load` hook, not as
-  `loadfile` arguments, because mpv logs command arguments at debug level.
-  The token must not appear in mpv's log at any level up to `debug`. ffmpeg
-  dumping raw HTTP requests at `trace` level is accepted (designer's call).
-  There is no auth proxy.
+  watch-later files or uosc's history. **mpv never receives the token.** mpv
+  logs every property it sets at `-v` and every command argument at `debug`,
+  so any header handed to mpv would end up in those logs. Media and subtitle
+  requests instead go to a small proxy mpvfin runs on `127.0.0.1`, which adds
+  the auth header itself. mpv only sees a localhost link with a random path,
+  limited to the server's `/Videos/` routes and useless once mpv closes.
 - **mpv's own resume fighting Jellyfin's**: Jellyfin is the source of truth
   for resume position. mpv's watch-later must neither override the start
   position nor record Jellyfin items. Set this per file.
@@ -203,6 +202,8 @@ In build order. Each step must be usable on its own before the next starts.
 - Watch-together partners use the TV app or the browser.
 - Joining watch together is done from a menu inside mpv.
 - Login via the server address in `script-opts`, with a saved token.
+- **A local auth proxy keeps the token away from mpv** (decided after testing
+  showed mpv logs the per-file header at `-v`).
 - **Testing uses a throwaway local Jellyfin in Docker**, never the owner's
   real server. Docker 29 with Compose v5 is available on the dev machine
   (Linux engine). The test server is scripted and reproducible:
@@ -235,9 +236,6 @@ are the designer's suggestions, not the owner's own requirements:
 - **Casting replaces whatever the window is playing**, like a Chromecast.
 - **Casting while in a watch-together group changes the group's queue**
   rather than leaving the group.
-- **Token hidden in mpv's logs up to `debug` level.** It is set via an
-  `on_load` hook. ffmpeg's `trace`-level request dumps are accepted, and
-  there is no auth proxy.
 - **Following the queue only.** If Jellyfin sent no next item, mpvfin does not
   go looking for the next episode itself.
 

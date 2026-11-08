@@ -64,8 +64,8 @@ username/password fallback, all anti-goals, and the Docker test server.
   - any `Debug` output;
   - mpv's log at levels up to `debug`.
 
-  Media auth is the per-file header `Authorization: MediaBrowser
-  Token="<token>"`, set from the `on_load` hook.
+  mpv never receives the token: media and subtitle requests go through
+  mpvfin's `127.0.0.1` proxy (Task 10), which adds the auth header.
 - No network I/O, sleep or blocking wait on the mpv event thread. Worker
   threads never touch the mpv handle directly. They send events through a
   channel and wake mpv.
@@ -1106,3 +1106,91 @@ pub fn poll_until<T>(timeout: Duration, f: impl FnMut() -> Option<T>) -> T; // p
 - [ ] **Step 5: Commit**
 
   `git add -A crates Cargo.toml Cargo.lock README.md docs && git commit -m "test: end-to-end casting tests against Docker Jellyfin; update docs"`
+
+---
+
+### Task 10: Local auth proxy (execute before Task 9)
+
+Added after Task 8's review showed mpv logs the per-file auth header at `-v`.
+The owner chose this over accepting the leak. It replaces the per-file header
+from Tasks 2, 5 and 7.
+
+**Files:**
+- Create: `crates/mpvfin-jellyfin/src/proxy.rs`
+- Modify: `crates/mpvfin-jellyfin/src/session.rs` (start and stop the proxy; pass its base to `resolve_media`)
+- Modify: `crates/mpvfin-jellyfin/src/lib.rs`
+- Modify: `crates/mpvfin-jellyfin/src/negotiate.rs` (drop the `auth_header` parameter)
+- Modify: `crates/mpvfin-jellyfin/src/identity.rs` (delete `media_auth_header` and its test)
+- Modify: `crates/mpvfin-core/src/lib.rs` (delete `ResolvedMedia.auth_header`)
+- Modify: `crates/mpvfin-cplugin/src/adapter.rs` (delete the `http-header-fields` pair)
+- Modify: `docs/jellyfin-protocol.md`
+
+**Interfaces:**
+
+```rust
+// proxy.rs
+pub type TokenSource = Arc<dyn Fn() -> Option<Secret> + Send + Sync>; // full Authorization header VALUE, None when logged out
+pub struct Proxy { /* … */ }
+impl Proxy {
+    pub fn start(upstream: BaseUrl, auth: TokenSource) -> std::io::Result<Self>; // binds 127.0.0.1:0, random 32-hex path secret
+    pub fn base(&self) -> &BaseUrl;  // http://127.0.0.1:<port>/<secret>
+    pub fn stop(&self);              // stop accepting; never blocks past ~1 s
+}
+pub struct Forward { pub path_and_query: String, pub range: Option<String>, pub head_only: bool }
+pub fn parse_request(head: &str, secret: &str) -> Result<Forward, u16>;   // Err = HTTP status to return
+pub fn response_head(status: u16, headers: &[(String, String)]) -> String;
+```
+
+`resolve_media` keeps building URLs from the `BaseUrl` it is given, so passing
+`proxy.base()` routes every stream and subtitle URL through the proxy without
+further changes. `ApiKey` stripping stays.
+
+**Rules to pin:**
+- `parse_request`:
+  - Method other than `GET`/`HEAD`: `405`.
+  - Path not starting `/<secret>/`: `404`.
+  - Remainder not starting `Videos/`: `403`, so a leaked link cannot reach the rest of the API.
+  - `..` in the path, raw or percent-encoded (`%2e`, any case): `403`.
+  - A malformed request line: `400`.
+  - `path_and_query` is the remainder with a leading `/`. `Range` is passed through only when it starts `bytes=`.
+- Request head limit 16 KiB (`431` beyond that) and a 10 s read timeout on it.
+- Upstream request:
+  - `Authorization` header value from `TokenSource`; `None` returns `503` without contacting the server.
+  - Connect timeout 5 s, **no** global timeout (a film outlasts any global limit), 30 s read timeout.
+  - Zero redirects, so the header never reaches another host; a 3xx upstream becomes `502`.
+- `response_head` writes only `Content-Type`, `Content-Length`, `Content-Range` and `Accept-Ranges` (case-insensitive match), and always `Connection: close`.
+- Upstream `200`/`206`/`404`/`416` statuses pass through. Other failures become `502`, with no upstream text in the body.
+- One thread per connection, body copied in chunks. A client disconnect or `stop()` ends the copy.
+- The token never appears in a log line, error or response.
+- `hook_properties` becomes three pairs: `stream-open-filename`, `file-local-options/force-media-title`, `file-local-options/save-position-on-quit`.
+
+- [ ] **Step 1: Write the failing tests** (`proxy.rs`, plus updates to existing ones)
+  - `parse_request_applies_path_and_method_rules`: a table covering every rule above, including `GET /s/Videos/a?x=1` → `/Videos/a?x=1`, `HEAD` → `head_only`, `/s/Users/x` → 403, `/s/Videos/%2E%2e/Users` → 403, `POST` → 405, `/wrong/Videos/a` → 404, and a `Range: items=1` header being dropped.
+  - `response_head_forwards_only_allowed_headers`: `Set-Cookie` is absent, `content-range` is kept, and `Connection: close` is present.
+  - `proxy_forwards_range_and_adds_auth_upstream`: a stub upstream on a `TcpListener` records the request and answers `206` with `Content-Range` and a body. The client gets `206` and the body. The upstream saw `Authorization` and `Range`, and the client's response bytes do not contain the token.
+  - `proxy_without_login_returns_503_and_skips_upstream`.
+  - `proxy_rejects_wrong_secret_without_contacting_upstream`.
+  - `upstream_redirect_is_not_followed`: stub answers `302` with `Location` pointing at a second stub. The client gets `502`, and the second stub sees no connection.
+  - `oversized_request_head_is_rejected`: 17 KiB of headers gives `431`.
+  - Update `hook_sets_stream_header_title_and_disables_watch_later` and rename it `hook_sets_stream_title_and_disables_watch_later`, asserting the three pairs and that nothing names `http-header-fields`.
+  - Update the `resolve_media` tests to drop the parameter.
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+  Run: `cargo test -p mpvfin-jellyfin proxy`
+  Expected: FAIL.
+
+- [ ] **Step 3: Implement the proxy and remove the per-file header** across the files listed.
+
+- [ ] **Step 4: Run the tests and lints**
+
+  Run: `cargo test --workspace` and `cargo clippy --workspace --all-targets -- -D warnings`, then build and run `./scripts/smoke-test-cplugin.ps1 -MpvPath .tools/mpv/mpv.com`.
+  Expected: PASS.
+
+- [ ] **Step 5: Verify against the Docker server**
+
+  Cast S01E01 to a real mpv (temp `--config-dir`, `--vo=null --ao=null`), seek by remote command, and switch to the external `fr` subtitle. Expected: position follows the seek, the subtitle loads, and an mpv log at `--msg-level=all=debug` contains neither the token nor `Authorization`.
+
+- [ ] **Step 6: Commit**
+
+  `git add -A crates docs && git commit -m "jellyfin: serve media through a local auth proxy so mpv never sees the token"`

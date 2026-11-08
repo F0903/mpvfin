@@ -24,6 +24,7 @@ use crate::identity::{auth_header, device_name, pct};
 use crate::negotiate::{capabilities_body, playback_info_body, resolve_media};
 use crate::proxy::{Proxy, TokenSource};
 use crate::report::{progress_body, started_body, stopped_body};
+use crate::segments::{parse_segments, segments_path};
 use crate::state::{LockError, State, StateFile};
 use crate::wire::{Inbound, parse_inbound};
 
@@ -83,6 +84,11 @@ pub enum Job {
     },
     /// Post a playback report.
     Report(Report),
+    /// `POST /UserPlayedItems/{id}`; dropped when logged out.
+    MarkPlayed {
+        /// Jellyfin item id.
+        item_id: String,
+    },
 }
 
 /// The running session; dropping it without `shutdown` detaches the threads.
@@ -524,16 +530,49 @@ fn work(queue: &Receiver<Job>, sink: &Sink, stop: &AtomicBool, creds: &Mutex<Opt
             } => {
                 // Always answered: an unanswered resolve would hold mpv's load hook forever.
                 let result = current
+                    .as_ref()
                     .ok_or_else(|| "not connected to Jellyfin".to_owned())
-                    .and_then(|c| resolve(&c, &item_id));
-                let event = match result {
-                    Ok(media) => ReceiverEvent::MediaResolved { generation, media },
-                    Err(message) => ReceiverEvent::MediaResolutionFailed {
-                        generation,
-                        message,
-                    },
+                    .and_then(|c| resolve(c, &item_id));
+                let (event, runtime) = match result {
+                    Ok((media, runtime)) => {
+                        (ReceiverEvent::MediaResolved { generation, media }, runtime)
+                    }
+                    Err(message) => (
+                        ReceiverEvent::MediaResolutionFailed {
+                            generation,
+                            message,
+                        },
+                        None,
+                    ),
                 };
+                let resolved = matches!(event, ReceiverEvent::MediaResolved { .. });
                 sink(SessionEvent::Receiver(event));
+                // After MediaResolved, so playback never waits for segments.
+                if let (true, Some(c)) = (resolved, &current) {
+                    match c.client.get(&segments_path(&item_id)) {
+                        Ok(reply) => {
+                            let segments = parse_segments(&reply, runtime);
+                            sink(SessionEvent::Receiver(ReceiverEvent::SegmentsResolved {
+                                generation,
+                                segments,
+                            }));
+                        }
+                        Err(e) => log(sink, format!("media segments unavailable: {e}")),
+                    }
+                }
+            }
+            Job::MarkPlayed { item_id } => {
+                let Some(c) = current else {
+                    continue;
+                };
+                let path = format!(
+                    "/UserPlayedItems/{}?userId={}",
+                    pct(&item_id),
+                    pct(&c.user_id)
+                );
+                if let Err(e) = c.client.post(&path, &Value::Null) {
+                    log(sink, format!("marking the item played failed: {e}"));
+                }
             }
             Job::Report(report) => {
                 let Some(c) = current else {
@@ -554,7 +593,8 @@ fn work(queue: &Receiver<Job>, sink: &Sink, stop: &AtomicBool, creds: &Mutex<Opt
     }
 }
 
-fn resolve(c: &Creds, item_id: &str) -> Result<ResolvedMedia, String> {
+/// The resolved media and the item's `RunTimeTicks`.
+fn resolve(c: &Creds, item_id: &str) -> Result<(ResolvedMedia, Option<i64>), String> {
     let failed = |e: HttpError| format!("Jellyfin request failed: {e}");
     let id = pct(item_id);
     let item = c
@@ -568,7 +608,8 @@ fn resolve(c: &Creds, item_id: &str) -> Result<ResolvedMedia, String> {
             &playback_info_body(&c.user_id),
         )
         .map_err(failed)?;
-    resolve_media(&c.media_base, item_id, &item, &info)
+    let runtime = item.get("RunTimeTicks").and_then(Value::as_i64);
+    resolve_media(&c.media_base, item_id, &item, &info).map(|m| (m, runtime))
 }
 
 #[cfg(test)]

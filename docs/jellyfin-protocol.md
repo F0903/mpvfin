@@ -233,3 +233,14 @@ sets this up without a reset.
   "StartTicks","EndTicks"}],"TotalRecordCount","StartIndex"}`; `Type` is
   `Intro`, `Outro`, `Recap` or `Preview`; ticks are 100 ns units.
   `includeSegmentTypes` filters.
+
+mpvfin requests
+`GET /MediaSegments/{id}?includeSegmentTypes=Intro&includeSegmentTypes=Recap&includeSegmentTypes=Outro&includeSegmentTypes=Preview`
+(200 with `Items` empty when the item has none; confirmed live). An `Outro`
+`EndTicks` may exceed the item's `RunTimeTicks` slightly; mpvfin treats a
+segment ending within 5 s of the runtime as running to the end of the file.
+
+## Marking played (verified against the test server)
+
+`POST /UserPlayedItems/{itemId}?userId={userId}` with no body returns 200 and
+`UserData.Played` becomes true (`DELETE` on the same path undoes it).

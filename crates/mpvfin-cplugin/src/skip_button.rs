@@ -111,12 +111,18 @@ pub fn define_section_commands(client: &str) -> Vec<Vec<String>> {
 /// Command enabling or disabling an input section.
 #[must_use]
 pub fn set_section_command(section: &str, enabled: bool) -> Vec<String> {
-    let command = if enabled {
+    let name = if enabled {
         "enable-section"
     } else {
         "disable-section"
     };
-    vec![command.to_owned(), section.to_owned()]
+    let mut command = vec![name.to_owned(), section.to_owned()];
+    // Its mouse area is the whole window; without these flags the cursor could
+    // not hide and the window could not be dragged during a segment.
+    if enabled && section == KEY_SECTION {
+        command.push("allow-hide-cursor+allow-vo-dragging".to_owned());
+    }
+    command
 }
 
 /// Whether a client message is a press of the `skip` binding: state `d` is a
@@ -221,7 +227,19 @@ mod tests {
         );
         assert_eq!(
             set_section_command(KEY_SECTION, true),
-            cmd(&["enable-section", "mpvfin-skip-key"])
+            cmd(&[
+                "enable-section",
+                "mpvfin-skip-key",
+                "allow-hide-cursor+allow-vo-dragging"
+            ])
+        );
+        assert_eq!(
+            set_section_command(CLICK_SECTION, true),
+            cmd(&["enable-section", "mpvfin-skip-click"])
+        );
+        assert_eq!(
+            set_section_command(KEY_SECTION, false),
+            cmd(&["disable-section", "mpvfin-skip-key"])
         );
         assert_eq!(
             set_section_command(CLICK_SECTION, false),

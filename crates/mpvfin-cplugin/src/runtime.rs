@@ -542,6 +542,7 @@ impl Runtime {
                 }
                 SessionEvent::Osd { text, duration } => self.mpv.show_text(&text, duration),
                 SessionEvent::Log(line) => self.mpv.log(&line),
+                SessionEvent::GroupList(_) => {} // wired in Task 8
             }
         }
     }

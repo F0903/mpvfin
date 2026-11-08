@@ -1,18 +1,21 @@
 //! The session supervisor (login, registration, WebSocket) and the job worker.
 //!
-//! Both run on their own threads; the caller's thread only queues jobs and
-//! sets flags, so no network I/O or sleep ever runs on it.
+//! All run on their own threads; the caller's thread only queues jobs and
+//! sets flags, so no network I/O or sleep ever runs on it. `SyncPlay` requests
+//! get a second job thread, so they never wait behind a report or a resolve.
 
 use std::hash::{BuildHasher, Hasher, RandomState};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, Mutex, PoisonError};
-use std::time::{Duration, Instant};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{fmt, fs, io, thread};
 
-use mpvfin_core::{Generation, PlaybackSnapshot, ReceiverEvent, ResolvedMedia, Secret};
+use mpvfin_core::{
+    Generation, GroupRequest, GroupSummary, PlaybackSnapshot, ReceiverEvent, ResolvedMedia, Secret,
+};
 use serde_json::{Value, json};
 use tungstenite::client::IntoClientRequest;
 use tungstenite::stream::MaybeTlsStream;
@@ -26,7 +29,15 @@ use crate::proxy::{Proxy, TokenSource};
 use crate::report::{progress_body, started_body, stopped_body};
 use crate::segments::{parse_segments, segments_path};
 use crate::state::{LockError, State, StateFile};
+use crate::syncplay::{
+    GroupUpdate, clock_sample, parse_groups, parse_utc_ms, request_path_and_body,
+};
 use crate::wire::{Inbound, parse_inbound};
+
+/// `/GetUtcTime` samples per clock batch.
+const CLOCK_SAMPLES: usize = 5;
+/// Time between clock batches while in a group.
+const CLOCK_PERIOD: Duration = Duration::from_mins(1);
 
 /// Where the plugin's files live.
 #[derive(Debug)]
@@ -51,6 +62,8 @@ pub enum SessionEvent {
     },
     /// Write to mpv's log; the plugin adds the `[mpvfin] ` prefix.
     Log(String),
+    /// The answer to [`Job::ListGroups`].
+    GroupList(Vec<GroupSummary>),
 }
 
 /// Receives session events from the session threads; must not block.
@@ -72,7 +85,7 @@ pub enum Report {
     },
 }
 
-/// Work for the job thread, run in submission order.
+/// Work for the job threads, each running its jobs in submission order.
 #[derive(Debug)]
 pub enum Job {
     /// Negotiate playback; answered with `MediaResolved` or `MediaResolutionFailed`.
@@ -89,20 +102,30 @@ pub enum Job {
         /// Jellyfin item id.
         item_id: String,
     },
+    /// Send a `SyncPlay` request; runs on the group thread.
+    Group(GroupRequest),
+    /// `GET /SyncPlay/List`, answered with `GroupList`; runs on the group thread.
+    ListGroups,
 }
 
 /// The running session; dropping it without `shutdown` detaches the threads.
 pub struct SessionHandle {
     jobs: Sender<Job>,
+    group_jobs: Sender<Job>,
     stop: Arc<AtomicBool>,
     worker_done: Receiver<()>,
+    group_done: Receiver<()>,
     supervisor_done: Receiver<()>,
 }
 
 impl SessionHandle {
     /// Queues a job; never blocks.
     pub fn submit(&self, job: Job) {
-        let _ = self.jobs.send(job);
+        let queue = match job {
+            Job::Group(_) | Job::ListGroups => &self.group_jobs,
+            _ => &self.jobs,
+        };
+        let _ = queue.send(job);
     }
 
     /// Runs queued jobs for up to `flush`, then closes the WebSocket; returns
@@ -111,14 +134,19 @@ impl SessionHandle {
     pub fn shutdown(self, flush: Duration) {
         let Self {
             jobs,
+            group_jobs,
             stop,
             worker_done,
+            group_done,
             supervisor_done,
         } = self;
         let started = Instant::now();
-        drop(jobs); // the worker exits once the queue is empty
+        // Both job threads exit once their queues are empty.
+        drop(jobs);
+        drop(group_jobs);
         let _ = worker_done.recv_timeout(flush);
-        stop.store(true, Ordering::Relaxed); // also makes the worker drop what is left
+        let _ = group_done.recv_timeout(flush.saturating_sub(started.elapsed()));
+        stop.store(true, Ordering::Relaxed); // also makes the workers drop what is left
         // Unused flush time goes to the socket close (reads wake every 250 ms).
         let budget = flush.saturating_add(Duration::from_secs(1));
         let _ = supervisor_done.recv_timeout(budget.saturating_sub(started.elapsed()));
@@ -136,28 +164,52 @@ struct Creds {
     media_base: BaseUrl,
 }
 
-/// Starts the supervisor and job threads and returns at once.
+/// The `SyncPlay` membership and clock, shared by the session threads.
+#[derive(Default)]
+struct GroupState {
+    /// The group to rejoin after a reconnect.
+    joined: Option<String>,
+    /// Server clock minus local clock.
+    offset_ms: i64,
+}
+
+/// Starts the supervisor, job, group and clock threads and returns at once.
 #[must_use]
 pub fn start(paths: Paths, sink: Sink) -> SessionHandle {
     let stop = Arc::new(AtomicBool::new(false));
     let creds = Arc::new(Mutex::new(None));
+    let group = Arc::new(Mutex::new(GroupState::default()));
     let (jobs, queue) = mpsc::channel();
+    let (group_jobs, group_queue) = mpsc::channel();
+    let (clock_wake, clock_woken) = mpsc::channel();
     let (supervisor_tx, supervisor_done) = mpsc::channel();
     let (worker_tx, worker_done) = mpsc::channel();
-    let (s, st, c) = (sink.clone(), stop.clone(), creds.clone());
+    let (group_tx, group_done) = mpsc::channel();
+    let (s, st, c, g) = (sink.clone(), stop.clone(), creds.clone(), group.clone());
     spawn("jobs", &sink, move || {
-        work(&queue, &s, &st, &c);
+        work(&queue, &s, &st, &c, &g);
         drop(worker_tx); // also dropped on unwind: `recv_timeout` sees the thread end
+    });
+    let (s, st, c, g) = (sink.clone(), stop.clone(), creds.clone(), group.clone());
+    spawn("group", &sink, move || {
+        work(&group_queue, &s, &st, &c, &g);
+        drop(group_tx);
+    });
+    let (s, st, c, g) = (sink.clone(), stop.clone(), creds.clone(), group.clone());
+    spawn("clock", &sink, move || {
+        keep_clock(&clock_woken, &s, &st, &c, &g);
     });
     let (s, st) = (sink.clone(), stop.clone());
     spawn("session", &s, move || {
-        supervise(&paths, &sink, &st, &creds);
+        supervise(&paths, &sink, &st, &creds, &group, &clock_wake);
         drop(supervisor_tx);
     });
     SessionHandle {
         jobs,
+        group_jobs,
         stop,
         worker_done,
+        group_done,
         supervisor_done,
     }
 }
@@ -182,8 +234,12 @@ fn osd(sink: &Sink, text: &str, secs: u64) {
     });
 }
 
+fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 fn set_creds(creds: &Mutex<Option<Creds>>, value: Option<Creds>) {
-    *creds.lock().unwrap_or_else(PoisonError::into_inner) = value;
+    *locked(creds) = value;
 }
 
 /// Sleeps in 1 s slices; false as soon as `stop` is set.
@@ -222,7 +278,14 @@ fn save(file: &mut StateFile, state: &State, sink: &Sink) {
     }
 }
 
-fn supervise(paths: &Paths, sink: &Sink, stop: &AtomicBool, creds: &Arc<Mutex<Option<Creds>>>) {
+fn supervise(
+    paths: &Paths,
+    sink: &Sink,
+    stop: &AtomicBool,
+    creds: &Arc<Mutex<Option<Creds>>>,
+    group: &Mutex<GroupState>,
+    clock_wake: &Sender<()>,
+) {
     let config = fs::read_to_string(&paths.config_file)
         .map_err(|e| e.to_string())
         .and_then(|text| parse_config(&text));
@@ -295,7 +358,7 @@ fn supervise(paths: &Paths, sink: &Sink, stop: &AtomicBool, creds: &Arc<Mutex<Op
             set_creds(
                 creds,
                 Some(Creds {
-                    client,
+                    client: client.clone(),
                     user_id,
                     auth,
                     media_base: proxy.base().clone(),
@@ -309,8 +372,9 @@ fn supervise(paths: &Paths, sink: &Sink, stop: &AtomicBool, creds: &Arc<Mutex<Op
                 Err(e) => break 'attempt format!("Jellyfin connection failed: {e}"),
             };
             log(sink, format!("connected to Jellyfin as {name}"));
+            rejoin(&client, group, sink);
             let connected = Instant::now();
-            let Err(e) = listen(socket, sink, stop) else {
+            let Err(e) = listen(socket, sink, stop, group, clock_wake) else {
                 return;
             };
             if connected.elapsed() >= Duration::from_mins(1) {
@@ -324,13 +388,21 @@ fn supervise(paths: &Paths, sink: &Sink, stop: &AtomicBool, creds: &Arc<Mutex<Op
     }
 }
 
+/// Joins the remembered group again: the old socket's close took us out of it.
+fn rejoin(client: &Client, group: &Mutex<GroupState>, sink: &Sink) {
+    let remembered = locked(group).joined.clone();
+    if let Some(group_id) = remembered {
+        let (path, body) = request_path_and_body(&GroupRequest::Join { group_id }, 0);
+        if let Err(e) = client.post(path, &body) {
+            log(sink, format!("rejoining the group failed: {e}"));
+        }
+    }
+}
+
 /// Starts the media proxy; it always sends the current login's header.
 fn start_proxy(base: &BaseUrl, creds: &Arc<Mutex<Option<Creds>>>) -> io::Result<Proxy> {
     let creds = creds.clone();
-    let auth: TokenSource = Arc::new(move || {
-        let current = creds.lock().unwrap_or_else(PoisonError::into_inner);
-        current.as_ref().map(|c| c.auth.clone())
-    });
+    let auth: TokenSource = Arc::new(move || locked(&creds).as_ref().map(|c| c.auth.clone()));
     Proxy::start(base.clone(), auth)
 }
 
@@ -482,8 +554,123 @@ fn open(url: &Secret) -> Result<Socket, String> {
     Ok(socket)
 }
 
+fn local_now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+}
+
+/// `When` (server time) minus the server's clock now.
+fn command_delay_ms(when_ms: i64, local_now_ms: i64, offset_ms: i64) -> i64 {
+    when_ms - (local_now_ms + offset_ms)
+}
+
+/// One `/GetUtcTime` round trip as `(offset, rtt)` in ms.
+fn clock_probe(client: &Client) -> Result<(i64, i64), HttpError> {
+    let t0 = local_now_ms();
+    let reply = client.get("/GetUtcTime")?;
+    let t3 = local_now_ms();
+    let stamp = |key| {
+        reply
+            .get(key)
+            .and_then(Value::as_str)
+            .and_then(parse_utc_ms)
+    };
+    match (
+        stamp("RequestReceptionTime"),
+        stamp("ResponseTransmissionTime"),
+    ) {
+        (Some(t1), Some(t2)) => Ok(clock_sample(t0, t1, t2, t3)),
+        _ => Err(HttpError::transport("bad /GetUtcTime reply")),
+    }
+}
+
+/// Measures the clock when woken and every `CLOCK_PERIOD`, while in a group.
+/// Ends when the supervisor drops the wake sender.
+fn keep_clock(
+    woken: &Receiver<()>,
+    sink: &Sink,
+    stop: &AtomicBool,
+    creds: &Mutex<Option<Creds>>,
+    group: &Mutex<GroupState>,
+) {
+    while !matches!(
+        woken.recv_timeout(CLOCK_PERIOD),
+        Err(RecvTimeoutError::Disconnected)
+    ) {
+        if locked(group).joined.is_none() {
+            continue;
+        }
+        let Some(c) = locked(creds).clone() else {
+            continue;
+        };
+        let samples: Vec<_> = (0..CLOCK_SAMPLES)
+            .take_while(|_| !stop.load(Ordering::Relaxed))
+            .map(|_| clock_probe(&c.client))
+            .collect();
+        let Some(&(offset_ms, rtt)) = samples.iter().flatten().min_by_key(|(_, rtt)| *rtt) else {
+            if let Some(Err(e)) = samples.last() {
+                log(sink, format!("clock sync failed: {e}"));
+            }
+            continue;
+        };
+        let in_group = {
+            let mut state = locked(group);
+            state.offset_ms = offset_ms;
+            state.joined.is_some()
+        };
+        // The server doubles this for its start delay, so it is one-way.
+        if in_group && let Err(e) = c.client.post("/SyncPlay/Ping", &json!({ "Ping": rtt / 2 })) {
+            log(sink, format!("group ping failed: {e}"));
+        }
+    }
+}
+
+/// Tracks membership and passes one `SyncPlay` message to the reducer.
+fn on_group_update(
+    update: GroupUpdate,
+    sink: &Sink,
+    group: &Mutex<GroupState>,
+    clock_wake: &Sender<()>,
+) {
+    let event = match update {
+        GroupUpdate::Joined { group_id } => {
+            locked(group).joined = Some(group_id.clone());
+            let _ = clock_wake.send(());
+            ReceiverEvent::GroupJoined { group_id }
+        }
+        GroupUpdate::Left => {
+            locked(group).joined = None;
+            ReceiverEvent::GroupLeft
+        }
+        GroupUpdate::Gone { message } => {
+            locked(group).joined = None;
+            ReceiverEvent::GroupGone {
+                message: message.to_owned(),
+            }
+        }
+        GroupUpdate::Queue(queue) => ReceiverEvent::GroupQueueChanged(queue),
+        GroupUpdate::Command {
+            mut command,
+            when_ms,
+        } => {
+            let offset_ms = locked(group).offset_ms;
+            command.delay_ms = command_delay_ms(when_ms, local_now_ms(), offset_ms);
+            ReceiverEvent::GroupCommandReceived(command)
+        }
+        GroupUpdate::Ignored => return,
+    };
+    sink(SessionEvent::Receiver(event));
+}
+
 /// Forwards inbound messages and sends keep-alives; `Ok` once `stop` is set.
-fn listen(mut socket: Socket, sink: &Sink, stop: &AtomicBool) -> Result<(), String> {
+fn listen(
+    mut socket: Socket,
+    sink: &Sink,
+    stop: &AtomicBool,
+    group: &Mutex<GroupState>,
+    clock_wake: &Sender<()>,
+) -> Result<(), String> {
     let mut keepalive = Duration::from_secs(30);
     let mut sent = Instant::now();
     loop {
@@ -504,8 +691,8 @@ fn listen(mut socket: Socket, sink: &Sink, stop: &AtomicBool) -> Result<(), Stri
                     sink(SessionEvent::Osd { text, duration });
                 }
                 Inbound::ForceKeepAlive(interval) => keepalive = interval / 2,
-                // Task 3 wires group updates into the session.
-                Inbound::Group(_) | Inbound::Ignored => {}
+                Inbound::Group(update) => on_group_update(update, sink, group, clock_wake),
+                Inbound::Ignored => {}
             },
             Ok(_) => {}
             Err(tungstenite::Error::Io(e))
@@ -518,13 +705,41 @@ fn listen(mut socket: Socket, sink: &Sink, stop: &AtomicBool) -> Result<(), Stri
     }
 }
 
-fn work(queue: &Receiver<Job>, sink: &Sink, stop: &AtomicBool, creds: &Mutex<Option<Creds>>) {
+fn work(
+    queue: &Receiver<Job>,
+    sink: &Sink,
+    stop: &AtomicBool,
+    creds: &Mutex<Option<Creds>>,
+    group: &Mutex<GroupState>,
+) {
     for job in queue {
         if stop.load(Ordering::Relaxed) {
             return; // the shutdown flush window is over
         }
-        let current = creds.lock().unwrap_or_else(PoisonError::into_inner).clone();
+        let current = locked(creds).clone();
         match job {
+            Job::Group(request) => {
+                let Some(c) = current else {
+                    log(sink, "group request failed: not connected".to_owned());
+                    continue;
+                };
+                // Stamped here, not at submit: this queue can be behind.
+                let server_now_ms = local_now_ms() + locked(group).offset_ms;
+                let (path, body) = request_path_and_body(&request, server_now_ms);
+                if let Err(e) = c.client.post(path, &body) {
+                    log(sink, format!("group request failed: {e}"));
+                }
+            }
+            Job::ListGroups => {
+                let Some(c) = current else {
+                    log(sink, "listing groups failed: not connected".to_owned());
+                    continue;
+                };
+                match c.client.get("/SyncPlay/List") {
+                    Ok(list) => sink(SessionEvent::GroupList(parse_groups(&list))),
+                    Err(e) => log(sink, format!("listing groups failed: {e}")),
+                }
+            }
             Job::Resolve {
                 generation,
                 item_id,
@@ -621,6 +836,7 @@ fn resolve(c: &Creds, item_id: &str) -> Result<(ResolvedMedia, Option<i64>), Str
 mod tests {
     use super::*;
     use crate::identity::new_device_id;
+    use crate::syncplay::format_utc;
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpListener;
 
@@ -638,14 +854,14 @@ mod tests {
         url
     }
 
-    fn stub_connection(stream: TcpStream, segments_asked: &Sender<()>) {
+    fn is_websocket(stream: &TcpStream) -> bool {
         let mut start = [0; 7];
-        if stream.peek(&mut start).is_ok() && &start == b"GET /so" {
-            let mut socket = tungstenite::accept(stream).unwrap();
-            while socket.read().is_ok() {}
-            return;
-        }
-        let mut reader = BufReader::new(&stream);
+        stream.peek(&mut start).is_ok() && &start == b"GET /so"
+    }
+
+    /// The request line and body of the one request on `stream`.
+    fn read_request(stream: &TcpStream) -> (String, String) {
+        let mut reader = BufReader::new(stream);
         let (mut request, mut body_length) = (String::new(), 0);
         reader.read_line(&mut request).unwrap();
         loop {
@@ -657,7 +873,26 @@ mod tests {
                 body_length = value.trim().parse().unwrap();
             }
         }
-        reader.read_exact(&mut vec![0; body_length]).unwrap();
+        let mut body = vec![0; body_length];
+        reader.read_exact(&mut body).unwrap();
+        (request, String::from_utf8(body).unwrap())
+    }
+
+    fn reply_json(mut stream: &TcpStream, body: &str) {
+        let reply = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(reply.as_bytes()).unwrap();
+    }
+
+    fn stub_connection(stream: TcpStream, segments_asked: &Sender<()>) {
+        if is_websocket(&stream) {
+            let mut socket = tungstenite::accept(stream).unwrap();
+            while socket.read().is_ok() {}
+            return;
+        }
+        let (request, _) = read_request(&stream);
         if request.contains("/MediaSegments/") {
             segments_asked.send(()).unwrap();
             loop {
@@ -669,11 +904,75 @@ mod tests {
         } else {
             "{}"
         };
-        let reply = format!(
-            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-            body.len()
-        );
-        (&stream).write_all(reply.as_bytes()).unwrap();
+        reply_json(&stream, body);
+    }
+
+    /// Serves a group session. Each WebSocket connection sends what the test
+    /// queues on `frames`, and `None` closes it. Every HTTP request is recorded
+    /// on `seen`; `/GetUtcTime` answers with the local clock plus `offset_ms`.
+    fn group_server(
+        seen: Sender<(String, String)>,
+        frames: Receiver<Option<String>>,
+        offset_ms: i64,
+    ) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let frames = Arc::new(Mutex::new(frames));
+        thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let (seen, frames) = (seen.clone(), frames.clone());
+                thread::spawn(move || {
+                    if is_websocket(&stream) {
+                        let mut socket = tungstenite::accept(stream).unwrap();
+                        let frames = frames.lock().unwrap();
+                        while let Ok(Some(frame)) = frames.recv() {
+                            socket.send(Message::text(frame)).unwrap();
+                        }
+                        drop(frames);
+                        let _ = socket.close(None);
+                        while socket.read().is_ok() {}
+                        return;
+                    }
+                    let (request, body) = read_request(&stream);
+                    let reply = if request.contains("/GetUtcTime") {
+                        let now = format_utc(local_now_ms() + offset_ms);
+                        format!(
+                            r#"{{"RequestReceptionTime":"{now}","ResponseTransmissionTime":"{now}"}}"#
+                        )
+                    } else {
+                        "{}".to_owned()
+                    };
+                    reply_json(&stream, &reply);
+                    let _ = seen.send((request, body));
+                });
+            }
+        });
+        url
+    }
+
+    /// Everything on `seen` up to and including the first request whose line
+    /// contains `wanted`.
+    fn requests_until(seen: &Receiver<(String, String)>, wanted: &str) -> Vec<(String, String)> {
+        let mut requests = Vec::new();
+        loop {
+            let request = seen
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap_or_else(|_| {
+                    let lines: Vec<_> = requests.iter().map(|(line, _)| line).collect();
+                    panic!("no {wanted} request; saw {lines:?}")
+                });
+            let done = request.0.contains(wanted);
+            requests.push(request);
+            if done {
+                return requests;
+            }
+        }
+    }
+
+    fn group_joined_frame(group_id: &str) -> String {
+        json!({"MessageType": "SyncPlayGroupUpdate",
+               "Data": {"GroupId": group_id, "Type": "GroupJoined", "Data": {}}})
+        .to_string()
     }
 
     /// Waits for an event `matches` accepts; false once `timeout` has passed.
@@ -708,10 +1007,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_stalled_segments_call_does_not_hold_up_the_next_resolve() {
-        let (asked_tx, segments_asked) = mpsc::channel();
-        let url = segments_stalling_server(asked_tx);
+    /// A session logged in to the stub at `url`, already connected.
+    fn connected_session(url: &str) -> (SessionHandle, Receiver<SessionEvent>, PathBuf) {
         let dir = std::env::temp_dir().join(format!("mpvfin-session-{}", new_device_id()));
         fs::create_dir_all(&dir).unwrap();
         let paths = Paths {
@@ -721,7 +1018,7 @@ mod tests {
         fs::write(&paths.config_file, format!("server={url}\n")).unwrap();
         let state = State {
             device_id: "device".to_owned(),
-            server: Some(BaseUrl::parse(&url).unwrap().as_str().to_owned()),
+            server: Some(BaseUrl::parse(url).unwrap().as_str().to_owned()),
             user_id: Some("user".to_owned()),
             access_token: Some("token".to_owned()),
         };
@@ -736,6 +1033,97 @@ mod tests {
         let connected =
             |e: &SessionEvent| matches!(e, SessionEvent::Log(l) if l.contains("connected"));
         assert!(wait_for(&events, Duration::from_secs(5), connected));
+        (session, events, dir)
+    }
+
+    #[test]
+    fn command_delay_uses_the_clock_offset() {
+        // The server is 1000 ms ahead, so `When` 1500 is 300 ms away at local 200.
+        assert_eq!(command_delay_ms(1500, 200, 1000), 300);
+        // Already past: negative, so a late start can catch up.
+        assert_eq!(command_delay_ms(1000, 200, 1000), -200);
+    }
+
+    #[test]
+    fn reconnect_rejoins_the_remembered_group() {
+        let (seen_tx, seen) = mpsc::channel();
+        let (frames, frames_rx) = mpsc::channel();
+        let url = group_server(seen_tx, frames_rx, 0);
+        let (session, _events, dir) = connected_session(&url);
+
+        frames.send(Some(group_joined_frame("g1"))).unwrap();
+        frames.send(None).unwrap(); // the socket drops while in the group
+
+        let requests = requests_until(&seen, "/SyncPlay/Join");
+        let capabilities = requests
+            .iter()
+            .filter(|(line, _)| line.contains("/Sessions/Capabilities/Full"))
+            .count();
+        assert_eq!(capabilities, 2, "the rejoin must follow the capabilities");
+        let (_, body) = requests.last().unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(body).unwrap(),
+            json!({"GroupId": "g1"})
+        );
+
+        session.shutdown(Duration::ZERO);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_clock_offset_times_commands_and_ready() {
+        const OFFSET_MS: i64 = 3_600_000;
+        let (seen_tx, seen) = mpsc::channel();
+        let (frames, frames_rx) = mpsc::channel();
+        let url = group_server(seen_tx, frames_rx, OFFSET_MS);
+        let (session, events, dir) = connected_session(&url);
+
+        frames.send(Some(group_joined_frame("g1"))).unwrap();
+        let requests = requests_until(&seen, "/SyncPlay/Ping");
+        let samples = requests
+            .iter()
+            .filter(|(line, _)| line.contains("/GetUtcTime"))
+            .count();
+        assert_eq!(samples, CLOCK_SAMPLES, "the Ping must follow the batch");
+        let ping: Value = serde_json::from_str(&requests.last().unwrap().1).unwrap();
+        assert!(ping["Ping"].is_i64(), "{ping}");
+
+        let when = format_utc(local_now_ms() + OFFSET_MS + 2000);
+        let command = json!({"MessageType": "SyncPlayCommand",
+            "Data": {"GroupId": "g1", "PlaylistItemId": "p", "When": when,
+                     "PositionTicks": 0, "Command": "Unpause"}});
+        frames.send(Some(command.to_string())).unwrap();
+        assert!(
+            wait_for(&events, Duration::from_secs(5), |e| matches!(
+                e,
+                SessionEvent::Receiver(ReceiverEvent::GroupCommandReceived(c))
+                    if (1000..=2100).contains(&c.delay_ms)
+            )),
+            "no command with a delay from the clock offset"
+        );
+
+        session.submit(Job::Group(GroupRequest::Ready {
+            position: Duration::ZERO,
+            is_playing: false,
+            pid: "p".to_owned(),
+        }));
+        let (_, body) = requests_until(&seen, "/SyncPlay/Ready").pop().unwrap();
+        let ready: Value = serde_json::from_str(&body).unwrap();
+        let stamped = parse_utc_ms(ready["When"].as_str().unwrap()).unwrap();
+        assert!(
+            (stamped - (local_now_ms() + OFFSET_MS)).abs() < 5000,
+            "Ready.When ignores the clock offset: {ready}"
+        );
+
+        session.shutdown(Duration::ZERO);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_stalled_segments_call_does_not_hold_up_the_next_resolve() {
+        let (asked_tx, segments_asked) = mpsc::channel();
+        let url = segments_stalling_server(asked_tx);
+        let (session, events, dir) = connected_session(&url);
 
         let (first, second) = (Generation::new(1).unwrap(), Generation::new(2).unwrap());
         session.submit(resolve_job(first, "a"));

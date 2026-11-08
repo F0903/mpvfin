@@ -394,6 +394,22 @@ pub enum ReceiverEvent {
     },
     /// The viewer asked to skip the active segment.
     SkipRequested,
+    /// The session joined a `SyncPlay` group.
+    GroupJoined {
+        /// Group id.
+        group_id: String,
+    },
+    /// The session left its group.
+    GroupLeft,
+    /// The group became unusable.
+    GroupGone {
+        /// User-facing reason.
+        message: String,
+    },
+    /// The group's queue changed.
+    GroupQueueChanged(GroupQueue),
+    /// A group playback command arrived.
+    GroupCommandReceived(GroupCommand),
     /// Periodic lifecycle-reporting tick.
     ProgressTick,
     /// Receiver shutdown.
@@ -858,6 +874,13 @@ impl Receiver {
                     self.dismissed = Some(segment);
                 }
             }
+            // wired in Task 4
+            #[allow(clippy::match_same_arms)]
+            ReceiverEvent::GroupJoined { .. }
+            | ReceiverEvent::GroupLeft
+            | ReceiverEvent::GroupGone { .. }
+            | ReceiverEvent::GroupQueueChanged(_)
+            | ReceiverEvent::GroupCommandReceived(_) => {}
             ReceiverEvent::ProgressTick => {
                 if let PlaybackState::Playing(snapshot) = &self.playback {
                     actions.push(ReceiverAction::ReportProgress(snapshot.clone()));

@@ -43,8 +43,8 @@ pub(crate) struct Group {
     reached_end: bool,
     /// The server has heard that playback stalled.
     buffering: bool,
-    /// The broadcast of the viewer's own Pause is on its way.
-    own_pause: bool,
+    /// The viewer's Pause and Unpause requests whose broadcasts are on their way.
+    own_requests: u32,
     /// A `GroupLoad` has not reached mpv's hook yet.
     load_coming: bool,
     /// An entry the server waits on stopped; only mpv going idle makes that final.
@@ -65,7 +65,7 @@ impl Group {
             resume_on_settle: false,
             reached_end: false,
             buffering: false,
-            own_pause: false,
+            own_requests: 0,
             load_coming: false,
             stopped_owing: false,
         }
@@ -168,7 +168,7 @@ impl Receiver {
         g.expected_paused = !plays_on || will_load;
         g.start = queue.start_position;
         g.reached_end = false;
-        g.own_pause = false;
+        g.own_requests = 0;
         g.stopped_owing = false;
         // A drift anchor from the old item would drag the new one to its clock.
         self.stop_following(actions);
@@ -198,6 +198,7 @@ impl Receiver {
     ) {
         let playing = self.playing_generation();
         let idle = self.current_generation().is_none();
+        let player_position = self.playing_position();
         let Some(g) = self.group.as_mut() else {
             return;
         };
@@ -208,11 +209,18 @@ impl Receiver {
         // Until a coming load reaches mpv, the open file is not the group's.
         let generation = playing.filter(|_| g.current_pid == self.opened_pid);
         let position = command.position;
-        let own_pause = mem::take(&mut g.own_pause);
+        // Our own request coming back: its position would undo a seek of the
+        // viewer's, as uosc pauses before it seeks and resumes on release.
+        let own_request = g.own_requests > 0;
+        g.own_requests = match command.kind {
+            GroupCommandKind::Pause | GroupCommandKind::Unpause => g.own_requests.saturating_sub(1),
+            GroupCommandKind::Seek | GroupCommandKind::Stop => 0,
+        };
         match command.kind {
             GroupCommandKind::Stop => {
                 if !zero && !idle {
                     g.awaiting_ready = false;
+                    g.buffering = false;
                     self.stop_player(actions);
                     self.stop_following(actions);
                 }
@@ -223,8 +231,7 @@ impl Receiver {
                 self.stop_following(actions);
                 if generation.is_some() {
                     self.control_pause(true, actions);
-                    // uosc pauses before it seeks: this would undo the viewer's seek.
-                    if !own_pause {
+                    if !own_request {
                         self.seek_unless_near(position, actions);
                     }
                 }
@@ -255,18 +262,32 @@ impl Receiver {
                     return;
                 };
                 g.expected_paused = false;
-                if command.delay_ms > 0 {
+                let scheduled = command.delay_ms > 0;
+                let target = if scheduled {
+                    position
+                } else {
+                    position + delay
+                };
+                // An anchor at the broadcast's position would seek the viewer back.
+                let start = if own_request {
+                    player_position.unwrap_or(target)
+                } else {
+                    target
+                };
+                if scheduled {
                     // The anchor for later; the seek may not have landed by then.
-                    g.start = position;
-                    self.seek_unless_near(position, actions);
+                    g.start = start;
+                }
+                if !own_request {
+                    self.seek_unless_near(target, actions);
+                }
+                if scheduled {
                     actions.push(ReceiverAction::ScheduleResume {
                         generation,
                         after: delay,
                     });
                 } else {
-                    let target = position + delay;
-                    self.seek_unless_near(target, actions);
-                    Self::start_playing(generation, target, actions);
+                    Self::start_playing(generation, start, actions);
                 }
             }
         }
@@ -327,9 +348,9 @@ impl Receiver {
         if paused == g.expected_paused || g.reached_end {
             return;
         }
+        g.own_requests += 1;
         if paused {
             g.expected_paused = true;
-            g.own_pause = true;
             actions.push(ReceiverAction::Group(GroupRequest::Pause));
             self.stop_following(actions);
         } else {
@@ -398,7 +419,7 @@ impl Receiver {
         g.own_seek = None;
         g.reached_end = false;
         g.buffering = false;
-        g.own_pause = false;
+        g.own_requests = 0;
         g.stopped_owing = false;
         let Some(pid) = self.opened_pid.clone() else {
             return;
@@ -1571,8 +1592,7 @@ mod tests {
 
     #[test]
     fn pause_seeks_to_the_given_position() {
-        let (mut r, g) = following("p1", 10);
-        pause_state(&mut r, g, false);
+        let (mut r, g) = playing(&["p1"], 10);
         let mut expected = stop_following(g);
         expected.extend([set_paused(g, true), seek(g, secs(12))]);
         assert_eq!(
@@ -2272,6 +2292,87 @@ mod tests {
             Some(&seek(g, secs(200))),
             "only the broadcast of the viewer's own Pause"
         );
+    }
+
+    #[test]
+    fn a_release_before_the_restart_still_reaches_the_viewers_seek() {
+        for delay_ms in [0, 500] {
+            let (mut r, g) = playing(&["p1"], 100);
+            pause(&mut r, g, true);
+            moved(&mut r, g, secs(400));
+            pause(&mut r, g, false);
+            let mut actions = r.handle(command(GroupCommandKind::Pause, "p1", secs(100), 0));
+            actions.extend(r.handle(command(
+                GroupCommandKind::Unpause,
+                "p1",
+                secs(100),
+                delay_ms,
+            )));
+            assert!(
+                !actions
+                    .iter()
+                    .any(|a| matches!(a, ReceiverAction::Seek { .. })),
+                "{actions:?}"
+            );
+            if delay_ms > 0 {
+                actions = r.handle(ReceiverEvent::GroupResumeDue { generation: g });
+            }
+            assert!(
+                actions.contains(&anchor(g, secs(400))),
+                "anchored at the broadcast's 100, the corrector would seek back: {actions:?}"
+            );
+            assert_eq!(
+                requests(&settle(&mut r, g, 400)),
+                [&GroupRequest::Seek {
+                    position: secs(400)
+                }]
+            );
+        }
+    }
+
+    #[test]
+    fn a_seek_stop_update_or_open_forgets_our_own_requests() {
+        let partners_pause = command(GroupCommandKind::Pause, "p1", secs(50), 0);
+
+        let (mut r, g) = playing(&["p1"], 10);
+        pause(&mut r, g, true);
+        r.handle(command(GroupCommandKind::Seek, "p1", secs(10), 0));
+        assert_eq!(
+            r.handle(partners_pause.clone()).last(),
+            Some(&seek(g, secs(50)))
+        );
+
+        let (mut r, g) = playing(&["p1"], 10);
+        pause(&mut r, g, true);
+        r.handle(command(GroupCommandKind::Stop, "p1", secs(0), 0));
+        assert_eq!(
+            r.handle(partners_pause.clone()).last(),
+            Some(&seek(g, secs(50)))
+        );
+
+        let (mut r, g) = playing(&["p1"], 10);
+        pause(&mut r, g, true);
+        r.handle(new_queue(200, &["p1"], 0, secs(10)));
+        assert_eq!(
+            r.handle(partners_pause.clone()).last(),
+            Some(&seek(g, secs(50)))
+        );
+
+        let (mut r, g) = playing(&["p1"], 10);
+        pause(&mut r, g, true);
+        let g2 = load_pid(&mut r, "p1", 80);
+        assert_ne!(g, g2);
+        assert_eq!(r.handle(partners_pause).last(), Some(&seek(g2, secs(50))));
+    }
+
+    #[test]
+    fn a_group_stop_while_buffering_keeps_the_group() {
+        let (mut r, g) = playing(&["p1"], 10);
+        r.handle(buffering(g, true));
+        r.handle(command(GroupCommandKind::Stop, "p1", secs(0), 0));
+        r.handle(ended(g, EndReason::Stopped));
+        assert!(r.handle(ReceiverEvent::PlayerIdle).is_empty());
+        assert_eq!(r.group_id(), Some("g"));
     }
 
     #[test]

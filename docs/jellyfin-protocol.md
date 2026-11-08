@@ -86,3 +86,25 @@ References:
 - [PlaybackStartInfo](https://github.com/jellyfin/jellyfin/blob/v10.11.11/MediaBrowser.Model/Session/PlaybackStartInfo.cs)
 - [PlaybackProgressInfo](https://github.com/jellyfin/jellyfin/blob/v10.11.11/MediaBrowser.Model/Session/PlaybackProgressInfo.cs)
 - [PlaybackStopInfo](https://github.com/jellyfin/jellyfin/blob/v10.11.11/MediaBrowser.Model/Session/PlaybackStopInfo.cs)
+
+## Test server provisioning
+
+`scripts/test-server.ps1 -Action up|down|reset` drives `tests/server/compose.yml`
+(image `jellyfin/jellyfin:10.11.11`, `127.0.0.1:8096`, named volumes). Calls
+verified against that image, all unauthenticated until login:
+
+1. `GET /System/Info/Public` (readiness; `StartupWizardCompleted`).
+2. Wizard: `POST /Startup/Configuration`
+   `{"UICulture","MetadataCountryCode","PreferredMetadataLanguage"}`;
+   `GET /Startup/User` (first-user record must exist); `POST /Startup/User`
+   `{"Name":"admin","Password":"mpvfin-test"}`; `POST /Startup/RemoteAccess`
+   `{"EnableRemoteAccess":true,"EnableAutomaticPortMapping":false}`;
+   `POST /Startup/Complete`.
+3. `POST /Users/AuthenticateByName` `{"Username","Pw"}` with an
+   `X-Emby-Authorization: MediaBrowser Client=..., Device=..., DeviceId=..., Version=...`
+   header; later calls add `Token="<AccessToken>"` to that header.
+4. `GET`/`POST /System/Configuration` with `QuickConnectAvailable=true`.
+5. `POST /Library/VirtualFolders?name=Shows&collectionType=tvshows&refreshLibrary=true`
+   with body `{"LibraryOptions":{"PathInfos":[{"Path":"/media/shows"}]}}`.
+6. `GET /Items?Recursive=true&IncludeItemTypes=Episode` until
+   `TotalRecordCount` is 3.

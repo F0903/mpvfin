@@ -78,7 +78,9 @@ impl Receiver {
     }
 
     pub(super) fn group_joined(&mut self, group_id: String, actions: &mut Vec<ReceiverAction>) {
-        self.group = Some(Group::new(group_id));
+        if self.group.replace(Group::new(group_id)).is_some() {
+            self.stop_following(actions);
+        }
         if mem::take(&mut self.creating_group)
             && let Some(position) = self.playing_position()
         {
@@ -104,6 +106,7 @@ impl Receiver {
         queue: GroupQueue,
         actions: &mut Vec<ReceiverAction>,
     ) {
+        let loaded_pid = self.loaded_pid().map(str::to_owned);
         let Some(g) = self.group.as_mut() else {
             return;
         };
@@ -115,6 +118,9 @@ impl Receiver {
         g.entries = queue.entries;
         let previous_pid = g.current_pid.take();
         let Some(index) = queue.playing_index.filter(|&i| i < g.entries.len()) else {
+            g.awaiting_ready = false;
+            g.resume_on_settle = false;
+            self.stop_following(actions);
             return;
         };
         let pid = g.entries[index].playlist_item_id.clone();
@@ -134,13 +140,15 @@ impl Receiver {
         }
         // Only removing the playing item changes it without a wait for Ready.
         let plays_on = queue.reason == QueueReason::RemoveItems && queue.is_playing;
+        let will_load = loaded_pid.as_deref() != Some(pid.as_str());
         g.awaiting_ready = !plays_on;
-        g.resume_on_settle = plays_on;
-        g.expected_paused = !queue.is_playing;
+        g.resume_on_settle = plays_on && will_load;
+        // The hook holds a load paused, whatever the group is doing.
+        g.expected_paused = !queue.is_playing || will_load;
         g.start = queue.start_position;
         // A drift anchor from the old item would drag the new one to its clock.
         self.stop_following(actions);
-        if self.loaded_pid() != Some(pid.as_str()) {
+        if will_load {
             actions.push(ReceiverAction::GroupLoad { entries, index });
             return;
         }
@@ -164,6 +172,8 @@ impl Receiver {
         command: &GroupCommand,
         actions: &mut Vec<ReceiverAction>,
     ) {
+        let playing = self.playing_generation();
+        let idle = self.current_generation().is_none();
         let Some(g) = self.group.as_mut() else {
             return;
         };
@@ -171,44 +181,64 @@ impl Receiver {
         if !zero && g.current_pid.as_deref() != Some(command.playlist_item_id.as_str()) {
             return;
         }
+        // Until a coming load reaches mpv, the open file is not the group's.
+        let generation = playing.filter(|_| g.current_pid == self.opened_pid);
         let position = command.position;
         match command.kind {
             GroupCommandKind::Stop => {
-                if !zero && self.current_generation().is_some() {
+                if !zero && !idle {
+                    g.awaiting_ready = false;
                     self.stop_player(actions);
                     self.stop_following(actions);
                 }
             }
             GroupCommandKind::Pause => {
                 g.expected_paused = true;
-                self.hold(actions);
-                self.seek_unless_near(position, actions);
+                g.resume_on_settle = false;
+                self.stop_following(actions);
+                if generation.is_some() {
+                    self.control_pause(true, actions);
+                    self.seek_unless_near(position, actions);
+                }
             }
             GroupCommandKind::Seek => {
+                // Nothing is open and no load is coming, so no Ready could follow.
+                if idle && !g.awaiting_ready && !g.resume_on_settle {
+                    self.abandon_group(actions);
+                    return;
+                }
                 g.expected_paused = true;
+                g.resume_on_settle = false;
                 g.awaiting_ready = true;
-                self.hold(actions);
-                self.group_seek(position, actions);
+                g.start = position;
+                self.stop_following(actions);
+                if generation.is_some() {
+                    self.control_pause(true, actions);
+                    self.group_seek(position, actions);
+                }
             }
             GroupCommandKind::Unpause => {
-                g.expected_paused = false;
                 let delay = Duration::from_millis(command.delay_ms.unsigned_abs());
+                if command.delay_ms <= 0 {
+                    actions.push(ReceiverAction::CancelResume);
+                }
+                // Not on the player yet: the Ready that follows gets this resent.
+                let Some(generation) = generation else {
+                    return;
+                };
+                g.expected_paused = false;
                 if command.delay_ms > 0 {
                     // The anchor for later; the seek may not have landed by then.
                     g.start = position;
                     self.seek_unless_near(position, actions);
-                    if let Some(generation) = self.playing_generation() {
-                        actions.push(ReceiverAction::ScheduleResume {
-                            generation,
-                            after: delay,
-                        });
-                    }
+                    actions.push(ReceiverAction::ScheduleResume {
+                        generation,
+                        after: delay,
+                    });
                 } else {
                     let target = position + delay;
                     self.seek_unless_near(target, actions);
-                    if let Some(generation) = self.playing_generation() {
-                        Self::start_playing(generation, target, actions);
-                    }
+                    Self::start_playing(generation, target, actions);
                 }
             }
         }
@@ -230,6 +260,7 @@ impl Receiver {
     /// mpv finished a load or seek on the current generation.
     pub(super) fn group_position_settled(
         &mut self,
+        generation: Generation,
         position: Duration,
         actions: &mut Vec<ReceiverAction>,
     ) {
@@ -242,13 +273,30 @@ impl Receiver {
         }
         if g.awaiting_ready {
             self.send_ready(position, actions);
-        } else if mem::take(&mut g.resume_on_settle)
-            && !g.expected_paused
-            && let Some(generation) = self.playing_generation()
-        {
+        } else if mem::take(&mut g.resume_on_settle) {
             // The hook loads every group entry paused.
+            g.expected_paused = false;
             Self::start_playing(generation, position, actions);
         }
+    }
+
+    /// The server has no timeout: an item it waits on that ended would hang
+    /// the group. An end of the item being replaced says nothing of the wait.
+    pub(super) fn group_load_ended(&mut self, actions: &mut Vec<ReceiverAction>) {
+        if self
+            .group
+            .as_ref()
+            .is_some_and(|g| g.awaiting_ready && g.current_pid == self.opened_pid)
+        {
+            self.abandon_group(actions);
+        }
+    }
+
+    fn abandon_group(&mut self, actions: &mut Vec<ReceiverAction>) {
+        self.group_leave(actions);
+        actions.push(ReceiverAction::ShowMessage {
+            text: "mpvfin: couldn't load that item, so you've left the group".to_owned(),
+        });
     }
 
     pub(super) fn group_load_options(&self) -> Option<GroupLoadOptions> {
@@ -280,11 +328,6 @@ impl Receiver {
                 position: None,
             });
         }
-    }
-
-    fn hold(&self, actions: &mut Vec<ReceiverAction>) {
-        self.stop_following(actions);
-        self.control_pause(true, actions);
     }
 
     fn start_playing(
@@ -507,6 +550,10 @@ mod tests {
         r.group.as_ref().unwrap().own_seek
     }
 
+    fn expected_paused(r: &Receiver) -> bool {
+        r.group.as_ref().unwrap().expected_paused
+    }
+
     #[test]
     fn joined_after_create_publishes_the_playing_queue() {
         let mut r = Receiver::new();
@@ -528,12 +575,12 @@ mod tests {
             vec![ReceiverAction::GroupPublishQueue { position: secs(12) }]
         );
         assert_eq!(r.group_id(), Some("g"));
-        assert!(
+        assert_eq!(
             r.handle(ReceiverEvent::GroupJoined {
                 group_id: "g".into()
-            })
-            .is_empty(),
-            "the create was consumed"
+            }),
+            stop_following(g),
+            "the create was consumed, and a rejoin stops what the old group started"
         );
     }
 
@@ -756,7 +803,7 @@ mod tests {
     #[test]
     fn empty_queue_loads_nothing() {
         let mut r = grouped();
-        assert!(
+        assert_eq!(
             r.handle(queue(
                 QueueReason::NewPlaylist,
                 100,
@@ -764,10 +811,10 @@ mod tests {
                 None,
                 secs(0),
                 false
-            ))
-            .is_empty()
+            )),
+            vec![ReceiverAction::CancelResume]
         );
-        assert!(
+        assert_eq!(
             r.handle(queue(
                 QueueReason::NewPlaylist,
                 100,
@@ -775,9 +822,25 @@ mod tests {
                 Some(5),
                 secs(0),
                 false
-            ))
-            .is_empty(),
+            )),
+            vec![ReceiverAction::CancelResume],
             "an index past the end names no entry"
+        );
+    }
+
+    #[test]
+    fn losing_the_current_item_stops_following() {
+        let (mut r, g) = following("p1", 10);
+        assert_eq!(
+            r.handle(queue(
+                QueueReason::RemoveItems,
+                200,
+                &[],
+                None,
+                secs(0),
+                false
+            )),
+            stop_following(g)
         );
     }
 
@@ -832,8 +895,13 @@ mod tests {
             )),
             expected
         );
+        assert!(expected_paused(&r), "the hook holds the load paused");
         let g2 = load_pid(&mut r, "p2", 80);
         pause_state(&mut r, g2, true);
+        assert!(
+            expected_paused(&r),
+            "that pause must not read as the viewer's"
+        );
         let actions = settle(&mut r, g2, 0);
         assert!(
             matches!(
@@ -843,6 +911,198 @@ mod tests {
             ),
             "the hook loads every group entry paused, and no Unpause will follow: {actions:?}"
         );
+        assert!(!expected_paused(&r));
+    }
+
+    #[test]
+    fn a_pause_during_a_plays_on_load_wins() {
+        for kind in [GroupCommandKind::Pause, GroupCommandKind::Seek] {
+            let (mut r, _) = following("p1", 10);
+            r.handle(queue(
+                QueueReason::RemoveItems,
+                200,
+                &["p2"],
+                Some(0),
+                secs(0),
+                true,
+            ));
+            let g2 = load_pid(&mut r, "p2", 80);
+            pause_state(&mut r, g2, true);
+            r.handle(command(kind, "p2", secs(0), 0));
+            assert!(
+                !settle(&mut r, g2, 0).contains(&set_paused(g2, false)),
+                "{kind:?}"
+            );
+            assert!(expected_paused(&r), "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn unpause_during_a_load_leaves_it_held() {
+        let mut r = grouped();
+        r.handle(new_queue(100, &["p1"], 0, secs(30)));
+        open_pid(&mut r, "p1", 70);
+        assert!(
+            r.handle(command(GroupCommandKind::Unpause, "p1", secs(30), 500))
+                .is_empty()
+        );
+        assert_eq!(
+            r.handle(command(GroupCommandKind::Unpause, "p1", secs(30), 0)),
+            vec![ReceiverAction::CancelResume]
+        );
+        assert!(
+            expected_paused(&r),
+            "the server resends the Unpause to a late Ready"
+        );
+    }
+
+    #[test]
+    fn commands_leave_the_old_file_alone_while_a_load_is_coming() {
+        let (mut r, g) = following("p1", 10);
+        pause_state(&mut r, g, false);
+        r.handle(new_queue(200, &["p2"], 0, secs(0)));
+        assert_eq!(
+            r.handle(command(GroupCommandKind::Pause, "p2", secs(50), 0)),
+            stop_following(g)
+        );
+        assert_eq!(
+            r.handle(command(GroupCommandKind::Seek, "p2", secs(50), 0)),
+            stop_following(g)
+        );
+        assert_eq!(
+            r.handle(command(GroupCommandKind::Unpause, "p2", secs(50), 0)),
+            vec![ReceiverAction::CancelResume]
+        );
+        assert!(
+            r.handle(command(GroupCommandKind::Unpause, "p2", secs(50), 500))
+                .is_empty()
+        );
+        assert!(!own_seek(&r));
+        assert!(expected_paused(&r));
+    }
+
+    #[test]
+    fn seek_during_resolving_moves_the_start() {
+        let mut r = grouped();
+        r.handle(new_queue(100, &["p1"], 0, secs(30)));
+        open_pid(&mut r, "p1", 70);
+        r.handle(command(GroupCommandKind::Seek, "p1", secs(40), 0));
+        assert!(matches!(
+            resolve(&mut r, gen_(1), "item-p1").as_slice(),
+            [ReceiverAction::ContinueLoad { group: Some(o), .. }] if o.start == secs(40)
+        ));
+    }
+
+    fn left_for_a_failed_load(g: Generation) -> Vec<ReceiverAction> {
+        let mut left = vec![ReceiverAction::Group(GroupRequest::Leave)];
+        left.extend(stop_following(g));
+        left.push(ReceiverAction::ShowMessage {
+            text: "mpvfin: couldn't load that item, so you've left the group".into(),
+        });
+        left
+    }
+
+    #[test]
+    fn failed_load_leaves_the_group() {
+        let mut r = grouped();
+        r.handle(new_queue(100, &["p1"], 0, secs(30)));
+        open_pid(&mut r, "p1", 70);
+        let actions = r.handle(ReceiverEvent::MediaResolutionFailed {
+            generation: gen_(1),
+            message: "boom".into(),
+        });
+        assert!(
+            matches!(
+                actions.as_slice(),
+                [ReceiverAction::AbortLoad { hook_id: 70 }, ReceiverAction::PlaybackFailed { .. }, rest @ ..]
+                    if rest == left_for_a_failed_load(gen_(1)).as_slice()
+            ),
+            "{actions:?}"
+        );
+        assert_eq!(r.group_id(), None);
+
+        let mut r = grouped();
+        r.handle(new_queue(100, &["p1"], 0, secs(30)));
+        let g = load_pid(&mut r, "p1", 70);
+        let actions = r.handle(ended(g, EndReason::Failed("x".into())));
+        assert!(
+            matches!(
+                actions.as_slice(),
+                [ReceiverAction::ReportStopped { .. }, ReceiverAction::PlaybackFailed { .. }, rest @ ..]
+                    if rest == left_for_a_failed_load(g).as_slice()
+            ),
+            "{actions:?}"
+        );
+        assert_eq!(r.group_id(), None);
+    }
+
+    #[test]
+    fn stop_while_awaiting_ready_leaves_the_group() {
+        let mut r = grouped();
+        r.handle(new_queue(100, &["p1"], 0, secs(30)));
+        let g = load_pid(&mut r, "p1", 70);
+        let actions = r.handle(ended(g, EndReason::Stopped));
+        assert!(
+            matches!(
+                actions.as_slice(),
+                [ReceiverAction::ReportStopped { .. }, rest @ ..]
+                    if rest == left_for_a_failed_load(g).as_slice()
+            ),
+            "{actions:?}"
+        );
+        assert_eq!(r.group_id(), None);
+
+        let mut r = grouped();
+        r.handle(new_queue(100, &["p1"], 0, secs(30)));
+        open_pid(&mut r, "p1", 70);
+        let mut expected = vec![
+            ReceiverAction::AbortLoad { hook_id: 70 },
+            ReceiverAction::StopPlayer {
+                generation: gen_(1),
+            },
+        ];
+        expected.extend(left_for_a_failed_load(gen_(1)));
+        assert_eq!(r.handle(ReceiverEvent::RemoteStop), expected);
+    }
+
+    #[test]
+    fn seek_with_nothing_loaded_leaves_the_group() {
+        let (mut r, g) = following("p1", 10);
+        r.handle(command(GroupCommandKind::Stop, "p1", secs(0), 0));
+        r.handle(ended(g, EndReason::Stopped));
+        assert_eq!(
+            r.handle(command(GroupCommandKind::Seek, "p1", secs(40), 0)),
+            left_for_a_failed_load(g)
+        );
+        assert_eq!(r.group_id(), None);
+    }
+
+    #[test]
+    fn a_seek_racing_the_load_does_not_leave() {
+        let mut r = grouped();
+        r.handle(new_queue(100, &["p1"], 0, secs(30)));
+        assert_eq!(
+            r.handle(command(GroupCommandKind::Seek, "p1", secs(40), 0)),
+            vec![ReceiverAction::CancelResume],
+            "the load is on its way; mpv has not reached its hook yet"
+        );
+        assert_eq!(r.group_id(), Some("g"));
+    }
+
+    #[test]
+    fn replacing_the_item_keeps_the_group() {
+        let (mut r, g) = following("p1", 10);
+        r.handle(new_queue(200, &["p2"], 0, secs(5)));
+        assert!(
+            matches!(
+                r.handle(ended(g, EndReason::Stopped)).as_slice(),
+                [ReceiverAction::ReportStopped { .. }]
+            ),
+            "the wait belongs to p2, and this end is p1's"
+        );
+        assert_eq!(r.group_id(), Some("g"));
+        let g2 = load_pid(&mut r, "p2", 80);
+        assert_eq!(settle(&mut r, g2, 5).last(), Some(&ready(secs(5), "p2")));
     }
 
     #[test]
@@ -875,6 +1135,18 @@ mod tests {
             r.handle(command(GroupCommandKind::Stop, "p1", secs(0), 0)),
             expected
         );
+        assert_eq!(r.group_id(), Some("g"));
+    }
+
+    #[test]
+    fn a_commanded_stop_during_the_wait_keeps_the_group() {
+        let (mut r, g) = following("p1", 10);
+        r.handle(command(GroupCommandKind::Seek, "p1", secs(40), 0));
+        r.handle(command(GroupCommandKind::Stop, "p1", secs(0), 0));
+        assert!(matches!(
+            r.handle(ended(g, EndReason::Stopped)).as_slice(),
+            [ReceiverAction::ReportStopped { .. }]
+        ));
         assert_eq!(r.group_id(), Some("g"));
     }
 
@@ -961,19 +1233,32 @@ mod tests {
         let (mut r, g) = following("p1", 10);
         assert_eq!(
             r.handle(command(GroupCommandKind::Unpause, "p1", secs(30), -2000)),
-            vec![seek(g, secs(32)), set_paused(g, false), anchor(g, secs(32))]
+            vec![
+                ReceiverAction::CancelResume,
+                seek(g, secs(32)),
+                set_paused(g, false),
+                anchor(g, secs(32))
+            ]
         );
 
         let (mut r, g) = following("p1", 32);
         assert_eq!(
             r.handle(command(GroupCommandKind::Unpause, "p1", secs(30), -2000)),
-            vec![set_paused(g, false), anchor(g, secs(32))]
+            vec![
+                ReceiverAction::CancelResume,
+                set_paused(g, false),
+                anchor(g, secs(32))
+            ]
         );
 
         let (mut r, g) = following("p1", 30);
         assert_eq!(
             r.handle(command(GroupCommandKind::Unpause, "p1", secs(30), 0)),
-            vec![set_paused(g, false), anchor(g, secs(30))],
+            vec![
+                ReceiverAction::CancelResume,
+                set_paused(g, false),
+                anchor(g, secs(30))
+            ],
             "zero delay is due now"
         );
     }

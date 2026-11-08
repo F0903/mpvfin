@@ -771,6 +771,7 @@ impl Receiver {
                         item_id,
                         message,
                     });
+                    self.group_load_ended(&mut actions);
                 }
                 other => self.playback = other,
             },
@@ -796,7 +797,7 @@ impl Receiver {
                     if seek_completed {
                         actions.push(ReceiverAction::ReportProgress(snapshot.clone()));
                         self.position_settled = true;
-                        self.group_position_settled(position, &mut actions);
+                        self.group_position_settled(generation, position, &mut actions);
                     }
                     self.evaluate_segments(&mut actions);
                 }
@@ -862,6 +863,7 @@ impl Receiver {
                             message,
                         });
                     }
+                    self.group_load_ended(&mut actions);
                 }
             }
             ReceiverEvent::RemotePause => self.control_pause(true, &mut actions),
@@ -1083,6 +1085,7 @@ impl Receiver {
                 let generation = *generation;
                 self.terminate_current(StopReason::Stopped, actions);
                 actions.push(ReceiverAction::StopPlayer { generation });
+                self.group_load_ended(actions);
             }
         }
     }

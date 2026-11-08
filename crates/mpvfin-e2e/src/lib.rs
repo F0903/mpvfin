@@ -7,14 +7,15 @@
     clippy::needless_pass_by_value
 )]
 
+use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -25,6 +26,7 @@ use serde_json::{Value, json};
 use ureq::Agent;
 
 const ADMIN: (&str, &str) = ("admin", "mpvfin-test");
+const PARTNER: (&str, &str) = ("partner", "mpvfin-test");
 const IPC_TIMEOUT: Duration = Duration::from_secs(10);
 const QUIT_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -61,7 +63,7 @@ impl Server {
             .timeout_global(Some(Duration::from_secs(30)))
             .build()
             .into();
-        let (user_id, token) = login(&agent, &base, "mpvfin-e2e-admin");
+        let (user_id, token) = login(&agent, &base, "mpvfin-e2e-admin", ADMIN);
         let auth = header("mpvfin-e2e-admin", Some(&token));
         Self {
             base,
@@ -108,7 +110,7 @@ impl Server {
 
     /// Logs in as admin under `device_id`: the state of an already logged-in plugin.
     pub fn device_login(&self, device_id: &str) -> State {
-        let (user_id, token) = login(&self.agent, &self.base, device_id);
+        let (user_id, token) = login(&self.agent, &self.base, device_id, ADMIN);
         State {
             device_id: device_id.to_owned(),
             server: Some(self.base.as_str().to_owned()),
@@ -292,6 +294,268 @@ Connection: close
     );
 }
 
+/// A scripted second `SyncPlay` client: user `partner` on its own random device, with a
+/// WebSocket reader thread. Each instance is a separate group member.
+pub struct Partner {
+    http: Arc<PartnerHttp>,
+    inbox: Arc<Inbox>,
+    stop: Arc<AtomicBool>,
+    reader: Option<thread::JoinHandle<()>>,
+}
+
+struct PartnerHttp {
+    agent: Agent,
+    base: BaseUrl,
+    auth: String,
+}
+
+impl PartnerHttp {
+    fn post(&self, path: &str, body: &Value) {
+        let url = self.base.join(path);
+        self.agent
+            .post(&url)
+            .header("Authorization", &self.auth)
+            .send_json(body)
+            .unwrap_or_else(|e| panic!("POST {url}: {e}"));
+    }
+
+    /// Answers a load or seek like a well-behaved client: ping, then `Ready` at `position`.
+    fn ready(&self, pid: &str, position: u64) {
+        self.post("/SyncPlay/Ping", &json!({"Ping": 10}));
+        self.post(
+            "/SyncPlay/Ready",
+            &json!({"When": utc_now(), "PositionTicks": position, "IsPlaying": false, "PlaylistItemId": pid}),
+        );
+    }
+}
+
+struct Inbox {
+    state: Mutex<InboxState>,
+    changed: Condvar,
+    auto_ready: AtomicBool,
+}
+
+#[derive(Default)]
+struct InboxState {
+    /// `(MessageType, Data)` not yet consumed by a `wait_*`.
+    messages: VecDeque<(String, Value)>,
+    queue: Value,
+}
+
+impl Partner {
+    /// Logs in as `partner` on a fresh device, posts capabilities and opens the socket.
+    pub fn connect(server: &Server) -> Self {
+        let device = mpvfin_jellyfin::new_device_id();
+        let (_, token) = login(&server.agent, &server.base, &device, PARTNER);
+        let http = Arc::new(PartnerHttp {
+            agent: server.agent.clone(),
+            base: server.base.clone(),
+            auth: header(&device, Some(&token)),
+        });
+        http.post(
+            "/Sessions/Capabilities/Full",
+            &json!({"PlayableMediaTypes": ["Video"], "SupportsMediaControl": true}),
+        );
+        let url = server
+            .base
+            .join(&format!("/socket?ApiKey={token}&deviceId={device}"))
+            .replacen("http", "ws", 1);
+        let (socket, _) = tungstenite::connect(url).expect("partner WebSocket");
+        let inbox = Arc::new(Inbox {
+            state: Mutex::new(InboxState::default()),
+            changed: Condvar::new(),
+            auto_ready: AtomicBool::new(true),
+        });
+        let stop = Arc::new(AtomicBool::new(false));
+        let reader = {
+            let (http, inbox, stop) = (http.clone(), inbox.clone(), stop.clone());
+            thread::spawn(move || partner_reader(socket, &http, &inbox, &stop))
+        };
+        Self {
+            http,
+            inbox,
+            stop,
+            reader: Some(reader),
+        }
+    }
+
+    /// Whether item-changing `PlayQueue` and `Seek` are answered with `Ready` (default on).
+    pub fn set_auto_ready(&self, on: bool) {
+        self.inbox.auto_ready.store(on, Ordering::SeqCst);
+    }
+
+    /// Creates a group and waits for `GroupJoined`; returns the group id.
+    pub fn create_group(&self, name: &str) -> String {
+        self.http.post("/SyncPlay/New", &json!({"GroupName": name}));
+        text(&self.wait_update("GroupJoined", Duration::from_secs(10))["GroupId"])
+    }
+
+    pub fn join(&self, group_id: &str) {
+        self.http
+            .post("/SyncPlay/Join", &json!({"GroupId": group_id}));
+    }
+
+    pub fn leave(&self) {
+        self.http.post("/SyncPlay/Leave", &json!({}));
+    }
+
+    pub fn set_new_queue(&self, item_ids: &[&str], index: usize, start: Duration) {
+        self.http.post(
+            "/SyncPlay/SetNewQueue",
+            &json!({"PlayingQueue": item_ids, "PlayingItemPosition": index, "StartPositionTicks": ticks(start)}),
+        );
+    }
+
+    pub fn pause(&self) {
+        self.http.post("/SyncPlay/Pause", &json!({}));
+    }
+
+    pub fn unpause(&self) {
+        self.http.post("/SyncPlay/Unpause", &json!({}));
+    }
+
+    pub fn stop(&self) {
+        self.http.post("/SyncPlay/Stop", &json!({}));
+    }
+
+    pub fn seek(&self, position: Duration) {
+        self.http
+            .post("/SyncPlay/Seek", &json!({"PositionTicks": ticks(position)}));
+    }
+
+    /// The next unconsumed `SyncPlayGroupUpdate` of `kind`: `{"GroupId","Data","Type"}`.
+    #[track_caller]
+    pub fn wait_update(&self, kind: &str, timeout: Duration) -> Value {
+        self.wait("SyncPlayGroupUpdate", "Type", kind, timeout)
+    }
+
+    /// The next unconsumed `SyncPlayCommand` whose `Command` is `kind`.
+    #[track_caller]
+    pub fn wait_command(&self, kind: &str, timeout: Duration) -> Value {
+        self.wait("SyncPlayCommand", "Command", kind, timeout)
+    }
+
+    /// The `Data` of the latest `PlayQueue` update, or null if none arrived.
+    pub fn last_queue(&self) -> Value {
+        self.inbox.state.lock().expect("inbox").queue.clone()
+    }
+
+    #[track_caller]
+    fn wait(&self, message: &str, field: &str, kind: &str, timeout: Duration) -> Value {
+        let deadline = Instant::now() + timeout;
+        let mut state = self.inbox.state.lock().expect("inbox");
+        loop {
+            let found = state
+                .messages
+                .iter()
+                .position(|(m, data)| m == message && data[field] == kind);
+            if let Some(found) = found {
+                return state.messages.remove(found).expect("found above").1;
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            assert!(!left.is_zero(), "no {message} {kind} within {timeout:?}");
+            state = self
+                .inbox
+                .changed
+                .wait_timeout(state, left)
+                .expect("inbox")
+                .0;
+        }
+    }
+}
+
+impl Drop for Partner {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
+    }
+}
+
+type PartnerSocket = tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<TcpStream>>;
+
+fn partner_reader(mut socket: PartnerSocket, http: &PartnerHttp, inbox: &Inbox, stop: &AtomicBool) {
+    if let tungstenite::stream::MaybeTlsStream::Plain(tcp) = socket.get_ref() {
+        let _ = tcp.set_read_timeout(Some(Duration::from_millis(100)));
+    }
+    while !stop.load(Ordering::SeqCst) {
+        match socket.read() {
+            Ok(tungstenite::Message::Text(raw)) => {
+                if let Ok(message) = serde_json::from_str::<Value>(raw.as_str()) {
+                    partner_handle(&message, http, inbox);
+                }
+            }
+            Ok(_) => {}
+            Err(tungstenite::Error::Io(e))
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            Err(_) => break,
+        }
+    }
+    let _ = socket.close(None);
+    let _ = socket.flush();
+}
+
+fn partner_handle(message: &Value, http: &PartnerHttp, inbox: &Inbox) {
+    let (kind, data) = (&message["MessageType"], message["Data"].clone());
+    let mut ready = None;
+    if kind == "SyncPlayGroupUpdate" && data["Type"] == "PlayQueue" {
+        let queue = &data["Data"];
+        inbox.state.lock().expect("inbox").queue = queue.clone();
+        let item_changing = ["NewPlaylist", "SetCurrentItem", "NextItem", "PreviousItem"]
+            .iter()
+            .any(|reason| queue["Reason"] == *reason);
+        if let (true, Some(index)) = (item_changing, queue["PlayingItemIndex"].as_u64()) {
+            let pid = &queue["Playlist"][usize::try_from(index).expect("index")]["PlaylistItemId"];
+            ready = Some((text(pid), queue["StartPositionTicks"].as_u64().unwrap_or(0)));
+        }
+    } else if kind == "SyncPlayCommand" && data["Command"] == "Seek" {
+        ready = Some((
+            text(&data["PlaylistItemId"]),
+            data["PositionTicks"].as_u64().unwrap_or(0),
+        ));
+    }
+    if let Some(kind) = kind.as_str() {
+        let mut state = inbox.state.lock().expect("inbox");
+        state.messages.push_back((kind.to_owned(), data));
+        inbox.changed.notify_all();
+    }
+    if let (true, Some((pid, position))) = (inbox.auto_ready.load(Ordering::SeqCst), ready) {
+        // A failed Ready shows up as the test's own timeout; the reader must not die on it.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            http.ready(&pid, position);
+        }));
+    }
+}
+
+/// Now in UTC as `2026-11-08T20:09:51.398Z`, which is what `When` takes.
+fn utc_now() -> String {
+    let since = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock after 1970");
+    let (days, secs) = (since.as_secs() / 86400, since.as_secs() % 86400);
+    // Civil date from a day count (Hinnant's algorithm).
+    let z = i64::try_from(days).expect("days") + 719_468;
+    let era = z / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{:03}Z",
+        secs / 3600,
+        secs % 3600 / 60,
+        secs % 60,
+        since.subsec_millis()
+    )
+}
+
 fn header(device_id: &str, token: Option<&str>) -> String {
     let token = token.map(|t| Secret::new(t.to_owned()));
     auth_header("mpvfin-e2e", device_id, token.as_ref())
@@ -299,12 +563,17 @@ fn header(device_id: &str, token: Option<&str>) -> String {
         .to_owned()
 }
 
-fn login(agent: &Agent, base: &BaseUrl, device_id: &str) -> (String, String) {
+fn login(
+    agent: &Agent,
+    base: &BaseUrl,
+    device_id: &str,
+    (user, password): (&str, &str),
+) -> (String, String) {
     let url = base.join("/Users/AuthenticateByName");
     let login: Value = agent
         .post(&url)
         .header("Authorization", &header(device_id, None))
-        .send_json(json!({"Username": ADMIN.0, "Pw": ADMIN.1}))
+        .send_json(json!({"Username": user, "Pw": password}))
         .and_then(|mut response| response.body_mut().read_json())
         .unwrap_or_else(|e| panic!("POST {url}: {e}"));
     (text(&login["User"]["Id"]), text(&login["AccessToken"]))

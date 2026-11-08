@@ -56,6 +56,12 @@ if (-not $cfg.QuickConnectAvailable -or $cfg.MinResumeDurationSeconds -ne 0) {
     Invoke-RestMethod "$base/System/Configuration" -Method Post -Headers $h -ContentType "application/json" -Body ($cfg | ConvertTo-Json -Depth 20) | Out-Null
 }
 
+# SyncPlay partner: the second user of the e2e group tests.
+$users = Invoke-RestMethod "$base/Users" -Headers $h
+if (-not ($users | Where-Object Name -eq "partner")) {
+    Invoke-RestMethod "$base/Users/New" -Method Post -Headers $h -ContentType "application/json" -Body '{"Name":"partner","Password":"mpvfin-test"}' | Out-Null
+}
+
 $folders = Invoke-RestMethod "$base/Library/VirtualFolders" -Headers $h
 if (-not ($folders | Where-Object Name -eq "Shows")) {
     Invoke-RestMethod "$base/Library/VirtualFolders?name=Shows&collectionType=tvshows&refreshLibrary=true" -Method Post -Headers $h `

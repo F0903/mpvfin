@@ -8,19 +8,20 @@ use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 use mpvfin_core::{
-    Generation, PlayerToken, Receiver, ReceiverAction, ReceiverEvent, ResolvedMedia, StopReason,
-    StreamSelection,
+    Generation, PlayerToken, Receiver, ReceiverAction, ReceiverEvent, ResolvedMedia, SegmentKind,
+    StopReason, StreamSelection,
 };
 use mpvfin_jellyfin::{Job, Paths, Report, SessionEvent, SessionHandle};
 
 use crate::adapter::{self, SubtitleStep, SubtitleWait, TrackKind};
 use crate::ffi::{
-    MPV_EVENT_COMMAND_REPLY, MPV_EVENT_END_FILE, MPV_EVENT_FILE_LOADED, MPV_EVENT_HOOK,
-    MPV_EVENT_PLAYBACK_RESTART, MPV_EVENT_PROPERTY_CHANGE, MPV_EVENT_SHUTDOWN,
-    MPV_EVENT_START_FILE, MPV_FORMAT_STRING, MpvEvent, MpvEventEndFile, MpvEventHook,
-    MpvEventProperty, MpvEventStartFile,
+    MPV_EVENT_CLIENT_MESSAGE, MPV_EVENT_COMMAND_REPLY, MPV_EVENT_END_FILE, MPV_EVENT_FILE_LOADED,
+    MPV_EVENT_HOOK, MPV_EVENT_PLAYBACK_RESTART, MPV_EVENT_PROPERTY_CHANGE, MPV_EVENT_SHUTDOWN,
+    MPV_EVENT_START_FILE, MPV_FORMAT_NONE, MPV_FORMAT_STRING, MpvEvent, MpvEventClientMessage,
+    MpvEventEndFile, MpvEventHook, MpvEventProperty, MpvEventStartFile,
 };
 use crate::mpv::{Mpv, from_c};
+use crate::skip_button::{self, CLICK_SECTION, KEY_SECTION};
 
 /// Interval of the reducer's progress tick.
 const TICK: Duration = Duration::from_secs(10);
@@ -32,9 +33,20 @@ const RESOLVE_DEADLINE: Duration = Duration::from_secs(4);
 /// Runs the plugin until mpv shuts down; the entry point's return value.
 pub fn run(mpv: Mpv) -> c_int {
     mpv.log("loaded");
-    for name in ["pause", "volume", "mute", "time-pos", "aid", "sid"] {
+    for name in [
+        "pause",
+        "volume",
+        "mute",
+        "time-pos",
+        "aid",
+        "sid",
+        "osd-width",
+        "osd-height",
+    ] {
         mpv.observe(name, MPV_FORMAT_STRING);
     }
+    // Only a change signal: the coordinates are read while a button is up.
+    mpv.observe("mouse-pos", MPV_FORMAT_NONE);
     mpv.hook_add("on_load", 50);
     // Left unexpanded on failure: such a path never exists, so the session
     // reports that no server is configured.
@@ -70,7 +82,9 @@ pub fn run(mpv: Mpv) -> c_int {
         pending_resolve: None,
         watch_later_dir,
         subtitle_wait: None,
+        skip_button: None,
     };
+    runtime.define_skip_sections();
     runtime.event_loop();
     runtime.shutdown()
 }
@@ -87,6 +101,7 @@ enum Event {
     },
     Restart,
     Property(String, Option<String>),
+    ClientMessage(Vec<String>),
     CommandReply {
         reply_id: u64,
         error: c_int,
@@ -136,6 +151,19 @@ impl Event {
                         Some(Self::Property(from_c(p.name)?, value))
                     })
                     .unwrap_or(Self::Other),
+                MPV_EVENT_CLIENT_MESSAGE => {
+                    data.cast::<MpvEventClientMessage>()
+                        .as_ref()
+                        .map_or(Self::Other, |m| {
+                            let count = usize::try_from(m.num_args).unwrap_or(0);
+                            // Non-UTF-8 becomes empty, so positions stay meaningful.
+                            Self::ClientMessage(
+                                (0..count)
+                                    .map(|i| from_c(*m.args.add(i)).unwrap_or_default())
+                                    .collect(),
+                            )
+                        })
+                }
                 MPV_EVENT_COMMAND_REPLY => Self::CommandReply {
                     reply_id: event.reply_userdata,
                     error: event.error,
@@ -156,6 +184,17 @@ struct Observed {
     position: Duration,
     aid: Option<String>,
     sid: Option<String>,
+    /// 0 while unknown.
+    osd_width: i64,
+    /// 0 while unknown.
+    osd_height: i64,
+}
+
+/// The skip button on screen.
+#[derive(Clone, Copy)]
+struct SkipButton {
+    kind: SegmentKind,
+    hovered: bool,
 }
 
 /// A playlist entry mpvfin resolves, from `ResolveMedia` until its end.
@@ -178,6 +217,7 @@ struct Runtime {
     pending_resolve: Option<PendingResolve>,
     watch_later_dir: String,
     subtitle_wait: Option<SubtitleWait>,
+    skip_button: Option<SkipButton>,
 }
 
 /// The latest `ResolveMedia`, until the job thread answers it.
@@ -228,6 +268,11 @@ impl Runtime {
                     }
                 }
                 Event::Property(name, value) => self.property(&name, value),
+                Event::ClientMessage(args) => {
+                    if skip_button::is_skip_press(&args) {
+                        self.feed(ReceiverEvent::SkipRequested);
+                    }
+                }
                 Event::CommandReply { reply_id, error } => self.sub_add_reply(reply_id, error),
                 Event::Shutdown => return,
                 Event::Other => {}
@@ -379,6 +424,15 @@ impl Runtime {
             }
             ("aid", _) => o.aid = value,
             ("sid", _) => o.sid = value,
+            ("osd-width", v) => {
+                o.osd_width = osd_length(v);
+                return self.skip_button_resized();
+            }
+            ("osd-height", v) => {
+                o.osd_height = osd_length(v);
+                return self.skip_button_resized();
+            }
+            ("mouse-pos", _) => return self.update_skip_hover(),
             _ => return,
         }
         if let Some(event) = self
@@ -542,11 +596,14 @@ impl Runtime {
                 self.session
                     .submit(Job::Report(Report::Stopped { snapshot, failed }));
             }
-            // wired in Task 4
-            ReceiverAction::ShowSkipButton { .. }
-            | ReceiverAction::HideSkipButton { .. }
-            | ReceiverAction::SeekToEnd { .. }
-            | ReceiverAction::MarkPlayed { .. } => {}
+            ReceiverAction::ShowSkipButton { kind, .. } => self.show_skip_button(kind),
+            ReceiverAction::HideSkipButton { .. } => self.hide_skip_button(),
+            ReceiverAction::SeekToEnd { .. } => {
+                self.run(&["seek", "100", "absolute-percent+exact"]);
+            }
+            ReceiverAction::MarkPlayed { item_id, .. } => {
+                self.session.submit(Job::MarkPlayed { item_id });
+            }
             ReceiverAction::PlaybackFailed { message, .. } => {
                 self.mpv
                     .show_text(&format!("mpvfin: {message}"), Duration::from_secs(5));
@@ -564,6 +621,75 @@ impl Runtime {
                 "no mpv track for Jellyfin {kind:?} stream {index}"
             )),
         }
+    }
+
+    /// Defines the button's input sections; they stay inert until enabled.
+    fn define_skip_sections(&self) {
+        let Some(client) = self.mpv.client_name() else {
+            self.mpv.log("mpv reported no client name: no skip input");
+            return;
+        };
+        for command in skip_button::define_section_commands(&client) {
+            self.run(&command);
+        }
+    }
+
+    fn show_skip_button(&mut self, kind: SegmentKind) {
+        self.skip_button = Some(SkipButton {
+            kind,
+            hovered: false,
+        });
+        self.run(&skip_button::set_section_command(KEY_SECTION, true));
+        self.draw_skip_button();
+        // The pointer may already be there, and a still pointer sends no change.
+        self.update_skip_hover();
+    }
+
+    fn hide_skip_button(&mut self) {
+        self.skip_button = None;
+        self.run(&skip_button::set_section_command(KEY_SECTION, false));
+        self.run(&skip_button::set_section_command(CLICK_SECTION, false));
+        self.run(&skip_button::clear_command());
+    }
+
+    fn draw_skip_button(&self) {
+        if let Some(button) = self.skip_button {
+            let (w, h) = osd_size(&self.observed);
+            self.run(&skip_button::draw_command(
+                button.kind,
+                w,
+                h,
+                button.hovered,
+            ));
+        }
+    }
+
+    fn skip_button_resized(&mut self) {
+        self.draw_skip_button();
+        self.update_skip_hover();
+    }
+
+    /// Rereads the pointer while a button is up; when it crosses the button's
+    /// edge, moves the click section and redraws.
+    fn update_skip_hover(&mut self) {
+        let Some(button) = self.skip_button else {
+            return;
+        };
+        let hovered = self.pointer_over_skip_button();
+        if hovered != button.hovered {
+            self.skip_button = Some(SkipButton { hovered, ..button });
+            self.run(&skip_button::set_section_command(CLICK_SECTION, hovered));
+            self.draw_skip_button();
+        }
+    }
+
+    fn pointer_over_skip_button(&self) -> bool {
+        let coordinate = |name| self.mpv.get_property(name)?.parse::<i64>().ok();
+        let (w, h) = osd_size(&self.observed);
+        self.mpv.get_property("mouse-pos/hover").as_deref() == Some("yes")
+            && coordinate("mouse-pos/x")
+                .zip(coordinate("mouse-pos/y"))
+                .is_some_and(|(x, y)| skip_button::button_rect(w, h).contains(x, y))
     }
 
     /// Runs an mpv command; a failure is logged.
@@ -586,6 +712,20 @@ fn yes_no(flag: bool) -> &'static str {
     if flag { "yes" } else { "no" }
 }
 
+/// An `osd-width` or `osd-height` value; 0 when missing or unparsable.
+fn osd_length(value: Option<&str>) -> i64 {
+    value.and_then(|v| v.parse().ok()).unwrap_or(0)
+}
+
+/// The OSD size to lay the button out on: without a video output mpv
+/// reports none, and the hit test must still work.
+fn osd_size(observed: &Observed) -> (i64, i64) {
+    match (observed.osd_width, observed.osd_height) {
+        (w, h) if w > 0 && h > 0 => (w, h),
+        _ => (1280, 720),
+    }
+}
+
 /// mpv's volume (up to 130) as a Jellyfin percentage.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // clamped to 0..=100 first
 fn percent(volume: f64) -> u8 {
@@ -595,6 +735,22 @@ fn percent(volume: f64) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_missing_or_zero_osd_counts_as_720p() {
+        let size = |osd_width, osd_height| {
+            osd_size(&Observed {
+                osd_width,
+                osd_height,
+                ..Observed::default()
+            })
+        };
+        assert_eq!(size(1920, 1080), (1920, 1080));
+        assert_eq!(size(0, 0), (1280, 720));
+        assert_eq!(size(1920, 0), (1280, 720));
+        assert_eq!(osd_length(None), 0);
+        assert_eq!(osd_length(Some("1920")), 1920);
+    }
 
     #[test]
     fn volume_is_clamped_and_rounded() {

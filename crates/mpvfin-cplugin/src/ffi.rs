@@ -91,6 +91,13 @@ pub struct MpvEventHook {
     pub id: u64,
 }
 
+/// `mpv_event_client_message`.
+#[repr(C)]
+pub struct MpvEventClientMessage {
+    pub num_args: c_int,
+    pub args: *const *const c_char,
+}
+
 /// `mpv_node`; only `u.string` is ever read.
 #[repr(C)]
 pub struct MpvNode {
@@ -117,6 +124,7 @@ const _: () = {
     assert!(offset_of!(MpvEventProperty, data) == 16);
     assert!(offset_of!(MpvEventEndFile, playlist_entry_id) == 8);
     assert!(offset_of!(MpvEventHook, id) == 8);
+    assert!(offset_of!(MpvEventClientMessage, args) == 8);
     assert!(size_of::<MpvNode>() == 16 && offset_of!(MpvNode, format) == 8);
 };
 

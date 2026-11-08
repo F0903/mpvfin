@@ -7,6 +7,7 @@ pub mod adapter;
 pub mod ffi;
 pub mod mpv;
 pub mod runtime;
+pub mod skip_button;
 
 use std::ffi::c_int;
 use std::panic::{self, AssertUnwindSafe};

@@ -8,10 +8,11 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use crate::ffi::{
-    self, MPV_EVENT_HOOK, MPV_FORMAT_NONE, MPV_FORMAT_STRING, MpvCommandAsyncFn, MpvCommandFn,
-    MpvCommandRetFn, MpvErrorStringFn, MpvEvent, MpvEventHook, MpvFreeFn, MpvFreeNodeContentsFn,
-    MpvGetPropertyStringFn, MpvHandle, MpvHookAddFn, MpvHookContinueFn, MpvNode, MpvNodeValue,
-    MpvObservePropertyFn, MpvSetPropertyStringFn, MpvWaitEventFn, MpvWakeupFn,
+    self, MPV_EVENT_HOOK, MPV_FORMAT_NONE, MPV_FORMAT_STRING, MpvClientNameFn, MpvCommandAsyncFn,
+    MpvCommandFn, MpvCommandRetFn, MpvErrorStringFn, MpvEvent, MpvEventHook, MpvFreeFn,
+    MpvFreeNodeContentsFn, MpvGetPropertyStringFn, MpvHandle, MpvHookAddFn, MpvHookContinueFn,
+    MpvNode, MpvNodeValue, MpvObservePropertyFn, MpvSetPropertyStringFn, MpvWaitEventFn,
+    MpvWakeupFn,
 };
 
 /// The plugin's mpv client handle.
@@ -31,6 +32,7 @@ pub struct Mpv {
     observe_property: MpvObservePropertyFn,
     hook_add: MpvHookAddFn,
     hook_continue: MpvHookContinueFn,
+    client_name: MpvClientNameFn,
     error_string: MpvErrorStringFn,
     pending_hooks: PendingHooks,
     waker: Waker,
@@ -62,6 +64,7 @@ impl Mpv {
                 observe_property: ffi::pfn_mpv_observe_property?,
                 hook_add: ffi::pfn_mpv_hook_add?,
                 hook_continue: ffi::pfn_mpv_hook_continue?,
+                client_name: ffi::pfn_mpv_client_name?,
                 error_string: ffi::pfn_mpv_error_string?,
                 pending_hooks: PendingHooks::default(),
                 waker: Waker::new(handle, ffi::pfn_mpv_wakeup?),
@@ -227,6 +230,14 @@ impl Mpv {
     #[must_use]
     pub fn waker(&self) -> Waker {
         self.waker.clone()
+    }
+
+    /// This client's name, which `script-binding` commands address it by.
+    #[must_use]
+    pub fn client_name(&self) -> Option<String> {
+        // SAFETY: the handle is live; mpv returns a NUL-terminated string
+        // that lives as long as the handle, and it is copied here.
+        unsafe { from_c((self.client_name)(self.handle)) }
     }
 
     /// mpv's description of an error code.

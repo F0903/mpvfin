@@ -28,9 +28,17 @@ After authentication, post this device's implemented media profile and command
 set to `POST /Sessions/Capabilities/Full`. Advertise only behavior covered by
 tests. The first command set is:
 
-- `Play` with `PlayNow` and one item;
-- `Playstate` with pause, unpause, play/pause, seek, and stop;
-- `GeneralCommand` with volume, mute, unmute, and toggle mute.
+- `Play` with `PlayNow`, `PlayNext` and `PlayLast` over `ItemIds`, honoring
+  `StartIndex`, `StartPositionTicks`, `AudioStreamIndex` and
+  `SubtitleStreamIndex` for `PlayNow`; other play commands are ignored;
+- `Playstate` with pause, unpause, play/pause, seek, stop, next and previous
+  track;
+- `GeneralCommand` with volume, mute, unmute, toggle mute,
+  `SetAudioStreamIndex`, `SetSubtitleStreamIndex` and `DisplayMessage`.
+  `Arguments` values are strings (`Volume`, `Index`, `Header`, `Text`,
+  `TimeoutMs`); a malformed argument ignores the command. Volume is clamped to
+  0-100, a subtitle index of -1 means off, and a display message defaults to
+  five seconds.
 
 Open `ws(s)://<server-base-path>/socket?ApiKey=<token>` after registration,
 preserving any path prefix in the configured server URL. Incoming envelopes

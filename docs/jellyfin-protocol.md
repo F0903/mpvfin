@@ -244,3 +244,12 @@ segment ending within 5 s of the runtime as running to the end of the file.
 
 `POST /UserPlayedItems/{itemId}?userId={userId}` with no body returns 200 and
 `UserData.Played` becomes true (`DELETE` on the same path undoes it).
+
+## Casting one episode (verified against the test server)
+
+A `PlayNow` for a single episode arrives with the rest of the series queued
+behind it: casting E02 alone gives the plugin `[E02, E03]` (seen as two
+`loadfile` commands; mpvfin adds nothing to the queue). Skipping to the end of
+E02 therefore plays E03 instead of leaving mpv idle, and the
+`skipping_credits_mid_file_lands_on_the_preview` test asserts only that E02
+ends, which is what the plan requires.

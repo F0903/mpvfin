@@ -15,6 +15,8 @@ use serde_json::{Value, json};
 const T10: Duration = Duration::from_secs(10);
 const T20: Duration = Duration::from_secs(20);
 const STATE_FILE: &str = "script-opts/mpvfin-state.json";
+const KEY_SECTION: &str = "mpvfin-skip-key";
+const CLICK_SECTION: &str = "mpvfin-skip-click";
 
 const fn secs(s: u64) -> Duration {
     Duration::from_secs(s)
@@ -49,6 +51,8 @@ fn options(server: &Server, state: State, mpv_conf: &str) -> PlayerOptions {
         state,
         mpv_conf: mpv_conf.to_owned(),
         config_dir: None,
+        default_bindings: false,
+        input_conf: String::new(),
     }
 }
 
@@ -65,11 +69,11 @@ fn connected_session(server: &Server, player: &Player, device: &str) -> String {
     session["Id"].as_str().expect("session id").to_owned()
 }
 
-fn cast_with(mpv_conf: &str, config_dir: Option<PathBuf>) -> Cast {
+fn cast_adjusted(adjust: impl FnOnce(&mut PlayerOptions)) -> Cast {
     let server = Server::connect();
     let device = fresh_id();
-    let mut opts = options(&server, server.device_login(&device), mpv_conf);
-    opts.config_dir = config_dir;
+    let mut opts = options(&server, server.device_login(&device), "");
+    adjust(&mut opts);
     let player = Player::launch(opts);
     let session = connected_session(&server, &player, &device);
     let items = server.episodes().into_iter().map(|(id, _)| id).collect();
@@ -82,8 +86,27 @@ fn cast_with(mpv_conf: &str, config_dir: Option<PathBuf>) -> Cast {
     }
 }
 
+fn cast_with(mpv_conf: &str, config_dir: Option<PathBuf>) -> Cast {
+    cast_adjusted(|opts| {
+        mpv_conf.clone_into(&mut opts.mpv_conf);
+        opts.config_dir = config_dir;
+    })
+}
+
 fn cast() -> Cast {
     cast_with("", None)
+}
+
+/// A cast with mpv's own keys live and no played state or resume left over.
+fn skip_cast(input_conf: &str) -> Cast {
+    let c = cast_adjusted(|opts| {
+        opts.default_bindings = true;
+        input_conf.clone_into(&mut opts.input_conf);
+    });
+    for item in &c.items {
+        c.server.clear_resume(item);
+    }
+    c
 }
 
 impl Cast {
@@ -112,6 +135,40 @@ impl Cast {
     #[track_caller]
     fn wait_mpv(&self, property: &str, expected: &Value) {
         wait_mpv(&self.player, property, expected);
+    }
+
+    fn position(&self) -> f64 {
+        self.player.get("time-pos").as_f64().expect("time-pos")
+    }
+
+    /// Waits for the button; its key section is enabled only while it is up.
+    #[track_caller]
+    fn wait_button(&self) {
+        poll_until(T20, || {
+            section_active(&self.player, KEY_SECTION).then_some(())
+        });
+    }
+
+    /// Waits up to 5 s for mpv's position to land in `low..=high`.
+    #[track_caller]
+    fn wait_position(&self, low: f64, high: f64) {
+        poll_until(secs(5), || {
+            self.player
+                .get("time-pos")
+                .as_f64()
+                .filter(|p| (low..=high).contains(p))
+        });
+    }
+
+    /// Asserts playback alone cannot reach `target` s within `wait_position`.
+    #[track_caller]
+    fn assert_far_from(&self, target: f64) {
+        let position = self.position();
+        assert!(position + 6.0 < target, "too close to {target}: {position}");
+    }
+
+    fn press(&self, key: &str) {
+        self.player.command(&["keypress", key]);
     }
 
     /// `(Index of second audio, Index of external subtitle)`.
@@ -146,6 +203,18 @@ fn wait_mpv(player: &Player, property: &str, expected: &Value) {
         reached.is_ok(),
         "mpv {property}: expected {expected}, last {last}"
     );
+}
+
+/// Whether `section` is enabled; mpv gives a disabled section priority -1.
+fn section_active(player: &Player, section: &str) -> bool {
+    let bindings = player.get("input-bindings");
+    bindings
+        .as_array()
+        .expect("input-bindings")
+        .iter()
+        .any(|b| {
+            b["section"] == section && b["priority"].as_i64().is_some_and(|priority| priority >= 0)
+        })
 }
 
 fn snapshot(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
@@ -421,6 +490,8 @@ fn mpv_stays_responsive_and_quits_when_server_unreachable() {
         state,
         mpv_conf: String::new(),
         config_dir: None,
+        default_bindings: false,
+        input_conf: String::new(),
     });
 
     std::thread::sleep(secs(2));
@@ -452,6 +523,8 @@ fn quit_is_bounded_while_resolve_stalls() {
         },
         mpv_conf: String::new(),
         config_dir: None,
+        default_bindings: false,
+        input_conf: String::new(),
     });
     player.wait_log("connected to Jellyfin", T20);
     poll_until(T20, || stub.item_requested().then_some(()));
@@ -549,4 +622,130 @@ demuxer-max-back-bytes=0
         !log.contains("Too many packets"),
         "demuxer overflowed, so this did not test a normal seek"
     );
+}
+
+#[test]
+#[ignore = "needs ./scripts/test-server.ps1 -Action up"]
+fn button_appears_in_intro_and_enter_skips_it() {
+    let c = skip_cast("");
+    let e01 = c.items[0].as_str();
+    c.play_one(e01, secs(8));
+    c.wait_button();
+    c.assert_far_from(20.0);
+
+    c.press("ENTER");
+    c.wait_position(20.0, 24.0);
+    c.wait_playing(e01);
+    assert!(
+        !section_active(&c.player, KEY_SECTION),
+        "button stayed up after the skip"
+    );
+}
+
+#[test]
+#[ignore = "needs ./scripts/test-server.ps1 -Action up"]
+fn enter_returns_to_mpv_after_the_segment() {
+    let c = skip_cast("");
+    let (e01, e02) = (c.items[0].as_str(), c.items[1].as_str());
+    c.server.play(&c.session, &[e01, e02], 0, secs(30));
+    c.wait_playing(e01);
+    assert!(
+        !section_active(&c.player, KEY_SECTION),
+        "no segment at 30 s"
+    );
+
+    c.press("ENTER");
+    c.wait_playing(e02);
+}
+
+#[test]
+#[ignore = "needs ./scripts/test-server.ps1 -Action up"]
+fn click_on_button_skips_and_click_elsewhere_does_not() {
+    let c = skip_cast("");
+    c.play_one(&c.items[0], secs(8));
+    c.wait_button();
+
+    // Under --vo=null only this makes mpv treat the pointer as hovering.
+    c.press("MOUSE_ENTER");
+    c.player.command(&["mouse", "10", "10"]);
+    c.press("MBTN_LEFT");
+    // No state to poll: this waits for a skip that must not happen.
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(c.position() < 20.0, "click off the button skipped");
+
+    c.player.command(&["mouse", "1150", "600"]); // inside the 1280x720 button
+    poll_until(T10, || {
+        section_active(&c.player, CLICK_SECTION).then_some(())
+    });
+    c.assert_far_from(20.0);
+    c.press("MBTN_LEFT");
+    c.wait_position(20.0, 24.0);
+}
+
+#[test]
+#[ignore = "needs ./scripts/test-server.ps1 -Action up"]
+fn user_input_conf_binding_wins_over_the_default_hotkey() {
+    let c = skip_cast("ENTER set pause yes\n");
+    c.play_one(&c.items[0], secs(8));
+    c.wait_button();
+
+    c.press("ENTER");
+    c.wait_mpv("pause", &json!(true));
+    assert!(c.position() < 20.0, "ENTER skipped");
+
+    c.player.command(&["script-binding", "mpvfin/skip"]);
+    c.wait_position(20.0, 24.0);
+}
+
+#[test]
+#[ignore = "needs ./scripts/test-server.ps1 -Action up"]
+fn skipping_credits_at_end_of_file_marks_played_and_plays_next() {
+    let c = skip_cast("");
+    let (e01, e02) = (c.items[0].as_str(), c.items[1].as_str());
+    // From 30 s, so the only button that can come up is the credits'.
+    c.server.play(&c.session, &[e01, e02], 0, secs(30));
+    c.wait_playing(e01);
+    c.player.command(&["seek", "102", "absolute"]);
+    c.wait_button();
+
+    c.press("ENTER");
+    c.wait_playing(e02);
+    poll_until(T10, || c.server.is_played(e01).then_some(()));
+}
+
+#[test]
+#[ignore = "needs ./scripts/test-server.ps1 -Action up"]
+fn skipping_credits_mid_file_lands_on_the_preview() {
+    let c = skip_cast("");
+    let e02 = c.items[1].as_str();
+    // From 30 s, past E02's recap, so the first button can only be the credits'.
+    c.play_one(e02, secs(30));
+    c.player.command(&["seek", "92", "absolute"]);
+    c.wait_button();
+
+    c.press("ENTER");
+    c.wait_position(110.0, 114.0);
+    c.wait_playing(e02);
+    poll_until(T10, || c.server.is_played(e02).then_some(()));
+
+    c.wait_button();
+    c.press("ENTER");
+    // Jellyfin queues the rest of the season behind one episode, so E03 follows.
+    c.session_where(|s| s["NowPlayingItem"]["Id"] != e02);
+}
+
+#[test]
+#[ignore = "needs ./scripts/test-server.ps1 -Action up"]
+fn no_segments_means_enter_stays_mpvs() {
+    let c = skip_cast("");
+    let (e03, e01) = (c.items[2].as_str(), c.items[0].as_str());
+    c.server.play(&c.session, &[e03, e01], 0, secs(10));
+    c.wait_playing(e03);
+    assert!(
+        !section_active(&c.player, KEY_SECTION),
+        "E03 has no segments"
+    );
+
+    c.press("ENTER");
+    c.wait_playing(e01);
 }

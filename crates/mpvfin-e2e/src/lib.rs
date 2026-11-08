@@ -182,7 +182,13 @@ impl Server {
         )
     }
 
-    /// Clears admin's resume position, so a stale one cannot pass a test.
+    /// Whether admin has `item_id` marked as played.
+    pub fn is_played(&self, item_id: &str) -> bool {
+        let item = self.get(&format!("/Items/{item_id}?userId={}", self.user_id));
+        item["UserData"]["Played"] == true
+    }
+
+    /// Clears admin's resume position and played state, so stale ones cannot pass a test.
     pub fn clear_resume(&self, item_id: &str) {
         let url = self.base.join(&format!(
             "/UserPlayedItems/{item_id}?userId={}",
@@ -346,6 +352,10 @@ pub struct PlayerOptions {
     /// `None`: a temporary directory that lives as long as the `Player`.
     /// Otherwise the caller's; config files already there are kept.
     pub config_dir: Option<PathBuf>,
+    /// Leaves `default` input sections and mpv's built-in keys live.
+    pub default_bindings: bool,
+    /// Appended to the generated `input.conf`.
+    pub input_conf: String,
 }
 
 /// Writes the config files `Player::launch` needs into `dir`.
@@ -357,7 +367,8 @@ pub fn write_config(dir: &Path, opts: &PlayerOptions) {
     };
     let conf = format!("{}# e2e-sentinel\n", opts.mpv_conf);
     write(dir.join("mpv.conf"), conf.as_bytes());
-    write(dir.join("input.conf"), b"# e2e\n");
+    let input = format!("# e2e\n{}", opts.input_conf);
+    write(dir.join("input.conf"), input.as_bytes());
     write(
         scripts.join("mpvfin.conf"),
         format!("server={}\n", opts.server).as_bytes(),
@@ -408,7 +419,7 @@ impl Player {
             .arg(format!("--log-file={}", log_path.display()))
             .arg("--msg-level=all=debug")
             // A stray Enter or media key on this machine would skip to the next item.
-            .arg("--input-default-bindings=no")
+            .args((!opts.default_bindings).then_some("--input-default-bindings=no"))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())

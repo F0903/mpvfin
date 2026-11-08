@@ -17,8 +17,8 @@ subtitles, and OSD messages. Start, progress and stop are reported, so resume
 position and watched status come out right. Changes you make in mpv are
 reported back too.
 
-Direct play only; items mpv cannot direct-play fail with an OSD message. The
-skip button and watch together are not built yet.
+Direct play only; items mpv cannot direct-play fail with an OSD message. Watch
+together is not built yet.
 
 It needs mpv 0.38 or newer (for `loadfile url flags index options`), built
 with C-plugin support. Windows is the tested platform.
@@ -55,6 +55,24 @@ goes back to Quick Connect.
 
 mpv then appears in Jellyfin's cast menu under your computer's name. Only the
 first open mpv window connects; others take over when it closes.
+
+## Skip button
+
+During an intro, recap, credits or preview, a button appears at the bottom
+right. Click it or press **Enter** to jump to the end of that segment. Skipping
+credits also marks the item as played; credits that run to the end of the file
+go straight to the next item.
+
+Enter is only mpvfin's while the button is up. The rest of the time it is mpv's
+own key (next in the playlist), and your own binding of Enter in `input.conf`
+always wins. To skip with a key of your choice, add this to `input.conf`:
+
+```text
+F5 script-binding mpvfin/skip
+```
+
+Your Jellyfin server needs a media segment provider plugin; without one it has
+no segments and the button never appears.
 
 ## Uninstall
 

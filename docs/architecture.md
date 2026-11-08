@@ -79,6 +79,30 @@ so mpv's own playlist is the queue and the user's next/previous keys work.
 Nothing mpvfin sets outlives the item, except volume and mute, which a remote
 is meant to change, and a remote unpause, which clears the user's own pause.
 
+## Skip button
+
+After `MediaResolved`, the `jobs` thread fetches the item's media segments
+(`GET /MediaSegments/{id}`), so playback never waits for them, and answers with
+`SegmentsResolved`. The reducer checks them on every position change and emits
+`ShowSkipButton` and `HideSkipButton`. A skipped segment stays dismissed until
+playback leaves it.
+
+The button is an `osd-overlay` plus two mpv input sections, defined at startup
+and inert until enabled, so nothing changes mpv's input while no button is up:
+
+- `mpvfin-skip-key` binds `ENTER` with `default`, so a user's own binding of the
+  key wins. It is enabled only while the button is up; afterwards Enter is mpv's
+  again.
+- `mpvfin-skip-click` binds `MBTN_LEFT` with `force`. It is enabled only while
+  the pointer is over the button, so a click elsewhere stays mpv's.
+
+Either key, or a user's `script-binding mpvfin/skip`, reaches the plugin as a
+client message and becomes `SkipRequested`. The reducer hides the button and
+seeks to the segment's end. A segment that runs to the end of the file (within
+5 s of the runtime) uses `seek 100 absolute-percent+exact` instead, so mpv
+reaches EOF and advances the playlist itself. Skipping credits also submits a
+`MarkPlayed` job, which runs on the `jobs` thread.
+
 ## Local auth proxy
 
 mpv logs every property it sets at `-v` and every command argument at `debug`,

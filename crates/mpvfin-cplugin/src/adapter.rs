@@ -166,6 +166,9 @@ pub fn hook_properties(
     ]
 }
 
+/// The `keep-open` of an entry of a `SyncPlay` queue.
+pub const GROUP_KEEP_OPEN: &str = "always";
+
 /// What the hook adds for an entry of a `SyncPlay` queue: it loads paused until
 /// the group starts, and holds at the end until the server moves on, without
 /// `keep-open-pause` so that holding doesn't look like a local pause.
@@ -173,7 +176,7 @@ pub fn hook_properties(
 pub fn group_hook_properties(start: Duration) -> Vec<(&'static str, String)> {
     vec![
         ("file-local-options/pause", "yes".to_owned()),
-        ("file-local-options/keep-open", "always".to_owned()),
+        ("file-local-options/keep-open", GROUP_KEEP_OPEN.to_owned()),
         ("file-local-options/keep-open-pause", "no".to_owned()),
         ("file-local-options/start", format_seconds(start)),
     ]

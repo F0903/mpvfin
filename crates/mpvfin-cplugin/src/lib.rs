@@ -6,6 +6,7 @@
 pub mod adapter;
 mod drift;
 pub mod ffi;
+pub mod group_menu;
 pub mod mpv;
 pub mod runtime;
 pub mod skip_button;

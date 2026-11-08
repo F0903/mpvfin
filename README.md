@@ -17,8 +17,7 @@ subtitles, and OSD messages. Start, progress and stop are reported, so resume
 position and watched status come out right. Changes you make in mpv are
 reported back too.
 
-Direct play only; items mpv cannot direct-play fail with an OSD message. Watch
-together is not built yet.
+Direct play only; items mpv cannot direct-play fail with an OSD message.
 
 It needs mpv 0.38 or newer (for `loadfile url flags index options`), built
 with C-plugin support. Windows is the tested platform.
@@ -76,6 +75,34 @@ off too; `script-binding mpvfin/skip` still works.
 
 Your Jellyfin server needs a media segment provider plugin; without one it has
 no segments and the button never appears.
+
+## Watch together
+
+Join or start a Jellyfin watch-together group from mpv. mpvfin claims no key
+for this, so bind one in `input.conf`:
+
+```text
+F6 script-binding mpvfin/watch-together
+```
+
+To reach it from uosc's menu instead, give the line a `#!` title (with `#` in
+place of the key, if you don't want a key at all):
+
+```text
+# script-binding mpvfin/watch-together  #! Watch together
+```
+
+The binding opens a list, in uosc when it is running and otherwise in mpv's own
+console (which needs mpv 0.39 or newer):
+
+- **_Name_ (_n_ members)** joins that group. The group you are in is left out.
+- **Create new group** starts a group named after this computer, with whatever
+  you are playing as its queue.
+- **Leave group**, shown while you are in one, leaves it. Playback carries on
+  by itself.
+
+If mpv's console is turned off (`load-console=no`) and uosc isn't installed, an
+OSD message says so instead.
 
 ## Uninstall
 

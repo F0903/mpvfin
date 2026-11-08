@@ -498,6 +498,7 @@ version = "0.1.0"
 dependencies = [
  "mpvfin-core",
  "mpvfin-jellyfin",
+ "serde_json",
 ]
 
 [[package]]

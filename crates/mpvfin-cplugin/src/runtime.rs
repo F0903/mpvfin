@@ -8,8 +8,8 @@ use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 use mpvfin_core::{
-    Generation, GroupEntry, GroupRequest, PlayerToken, Receiver, ReceiverAction, ReceiverEvent,
-    ResolvedMedia, SegmentKind, StopReason, StreamSelection,
+    Generation, GroupEntry, GroupRequest, GroupSummary, PlayerToken, Receiver, ReceiverAction,
+    ReceiverEvent, ResolvedMedia, SegmentKind, StopReason, StreamSelection,
 };
 use mpvfin_jellyfin::{Job, Paths, Report, SessionEvent, SessionHandle};
 
@@ -21,6 +21,7 @@ use crate::ffi::{
     MPV_EVENT_SHUTDOWN, MPV_EVENT_START_FILE, MPV_FORMAT_NONE, MPV_FORMAT_STRING, MpvEvent,
     MpvEventClientMessage, MpvEventEndFile, MpvEventHook, MpvEventProperty, MpvEventStartFile,
 };
+use crate::group_menu::{self, ConsoleEvent, MenuChoice, MenuItem, UoscEvent};
 use crate::mpv::{Mpv, from_c};
 use crate::skip_button::{self, CLICK_SECTION, KEY_SECTION};
 
@@ -41,6 +42,10 @@ const UOSC_MENU: &str = "user-data/uosc/menu/type";
 
 /// How long a message about the group stays on the OSD.
 const MESSAGE_DURATION: Duration = Duration::from_secs(5);
+
+/// How long a group list may be out before another press asks again: the
+/// session answers a failed request only in the log. The HTTP client's limit.
+const GROUP_LIST_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Runs the plugin until mpv shuts down; the entry point's return value.
 pub fn run(mpv: Mpv) -> c_int {
@@ -106,6 +111,8 @@ pub fn run(mpv: Mpv) -> c_int {
         drift: DriftCorrector::new(),
         drift_generation: None,
         seeking: false,
+        group_list_sent: None,
+        menu_items: None,
     };
     runtime.define_skip_sections();
     runtime.event_loop();
@@ -229,6 +236,8 @@ struct Entry {
     generation: Generation,
     /// Media and selection from `ContinueLoad`.
     media: Option<(ResolvedMedia, StreamSelection)>,
+    /// `keep-open` before the group hook replaced it; `None` outside a group.
+    keep_open_before: Option<String>,
 }
 
 struct Runtime {
@@ -254,6 +263,10 @@ struct Runtime {
     drift_generation: Option<Generation>,
     /// Between `SEEK` and `PLAYBACK_RESTART`.
     seeking: bool,
+    /// When the unanswered `ListGroups` went out.
+    group_list_sent: Option<Instant>,
+    /// What the watch-together menu last offered, until a choice.
+    menu_items: Option<Vec<MenuItem>>,
 }
 
 /// The latest `ResolveMedia`, until the job thread answers it.
@@ -319,15 +332,7 @@ impl Runtime {
                     }
                 }
                 Event::Property(name, value) => self.property(&name, value),
-                Event::ClientMessage(args) => {
-                    if adapter::key_press_name(&args) == Some("skip") {
-                        let had_button = self.skip_button.is_some();
-                        self.feed(ReceiverEvent::SkipRequested);
-                        if had_button && self.skip_button.is_none() {
-                            self.skip_sections_off_at = Some(Instant::now() + SKIP_LINGER);
-                        }
-                    }
-                }
+                Event::ClientMessage(args) => self.client_message(&args),
                 Event::CommandReply { reply_id, error } => self.sub_add_reply(reply_id, error),
                 Event::Shutdown => return,
                 Event::Other => {}
@@ -340,6 +345,32 @@ impl Runtime {
                 next_tick = Instant::now() + TICK;
                 self.feed(ReceiverEvent::ProgressTick);
             }
+        }
+    }
+
+    fn client_message(&mut self, args: &[String]) {
+        match adapter::key_press_name(args) {
+            Some("skip") => {
+                let had_button = self.skip_button.is_some();
+                self.feed(ReceiverEvent::SkipRequested);
+                if had_button && self.skip_button.is_none() {
+                    self.skip_sections_off_at = Some(Instant::now() + SKIP_LINGER);
+                }
+            }
+            Some("watch-together") => self.request_group_menu(),
+            _ => {}
+        }
+        // A close needs nothing: it can be the echo of our own close-menu,
+        // landing after a newer menu opened, and the items wait for the next one.
+        if let [name, json] = args
+            && name == group_menu::UOSC_MESSAGE
+            && let Some(UoscEvent::Activate(index)) = group_menu::parse_uosc_event(json)
+        {
+            self.run(&group_menu::uosc_close_command());
+            self.menu_chosen(index);
+        }
+        if let Some(ConsoleEvent::Submit(index)) = group_menu::parse_console_event(args) {
+            self.menu_chosen(index);
         }
     }
 
@@ -641,15 +672,96 @@ impl Runtime {
                 }
                 SessionEvent::Osd { text, duration } => self.mpv.show_text(&text, duration),
                 SessionEvent::Log(line) => self.mpv.log(&line),
-                SessionEvent::GroupList(_) => {} // wired in Task 8
+                // No press waits on the late answer to a request that was asked again.
+                SessionEvent::GroupList(groups) => {
+                    if self.group_list_sent.take().is_some() {
+                        self.open_group_menu(&groups);
+                    }
+                }
             }
         }
     }
 
     fn feed(&mut self, event: ReceiverEvent) {
+        let was_grouped = self.receiver.group_id().is_some();
         for action in self.receiver.handle(event) {
             self.execute(action);
         }
+        let grouped = self.receiver.group_id().is_some();
+        if grouped != was_grouped {
+            self.apply_group_keep_open(grouped);
+        }
+    }
+
+    /// The group hook makes its entry wait at the end for the server. Out of
+    /// the group nothing would move it on, so it gets the viewer's value back;
+    /// rejoining with the same entry still open makes it wait again.
+    fn apply_group_keep_open(&self, grouped: bool) {
+        let entry = self.current.and_then(|id| self.entries.get(&id));
+        if let Some(before) = entry.and_then(|entry| entry.keep_open_before.as_deref()) {
+            let value = if grouped {
+                adapter::GROUP_KEEP_OPEN
+            } else {
+                before
+            };
+            self.set("file-local-options/keep-open", value);
+        }
+    }
+
+    /// A press while a list is on its way does nothing, or two menus would open.
+    fn request_group_menu(&mut self) {
+        if self
+            .group_list_sent
+            .is_none_or(|sent| sent.elapsed() >= GROUP_LIST_TIMEOUT)
+        {
+            self.group_list_sent = Some(Instant::now());
+            self.session.submit(Job::ListGroups);
+        }
+    }
+
+    fn open_group_menu(&mut self, groups: &[GroupSummary]) {
+        let Some(client) = self.mpv.client_name() else {
+            self.mpv.log("mpv reported no client name: no menu");
+            return;
+        };
+        let items = group_menu::menu_items(groups, self.receiver.group_id());
+        let opened = if self.accepted(&group_menu::uosc_probe_command()) {
+            self.accepted(&group_menu::uosc_open_command(&items, &client))
+        } else {
+            let legacy = self
+                .mpv
+                .get_property("mpv-version")
+                .is_some_and(|version| group_menu::console_is_legacy(&version));
+            self.accepted(&group_menu::console_open_command(
+                &items,
+                &client,
+                group_menu::CONSOLE_HANDLER,
+                legacy,
+            ))
+        };
+        if opened {
+            self.menu_items = Some(items);
+        } else {
+            self.mpv.show_text(
+                "mpvfin: watch together needs uosc or mpv's console",
+                MESSAGE_DURATION,
+            );
+        }
+    }
+
+    /// Taken, so a double activation can't act twice.
+    fn menu_chosen(&mut self, index: usize) {
+        let chosen = self.menu_items.take();
+        let Some(item) = chosen.and_then(|items| items.into_iter().nth(index)) else {
+            return;
+        };
+        self.feed(match item.choice {
+            MenuChoice::Join(group_id) => ReceiverEvent::GroupJoin { group_id },
+            MenuChoice::Create => ReceiverEvent::GroupCreate {
+                name: mpvfin_jellyfin::device_name(),
+            },
+            MenuChoice::Leave => ReceiverEvent::GroupLeave,
+        });
     }
 
     // One arm per action keeps the adapter auditable against the reducer.
@@ -671,6 +783,7 @@ impl Runtime {
                 let entry = Entry {
                     generation,
                     media: None,
+                    keep_open_before: None,
                 };
                 self.entries.insert(token.entry_id, entry);
                 self.pending_resolve = Some(PendingResolve {
@@ -690,6 +803,10 @@ impl Runtime {
                 selection,
                 group,
             } => {
+                let keep_open_before = group
+                    .is_some()
+                    .then(|| self.mpv.get_property("keep-open"))
+                    .flatten();
                 let group_properties = group
                     .map(|options| adapter::group_hook_properties(options.start))
                     .unwrap_or_default();
@@ -705,6 +822,7 @@ impl Runtime {
                     .find(|e| e.generation == generation)
                 {
                     entry.media = Some((media, selection));
+                    entry.keep_open_before = keep_open_before;
                 }
                 self.mpv.hook_continue(hook_id);
             }
@@ -921,6 +1039,12 @@ impl Runtime {
             self.mpv.log(e);
         }
         result.is_ok()
+    }
+
+    /// Whether mpv takes the command; a refusal here is an answer, not a failure to log.
+    fn accepted(&self, args: &[String]) -> bool {
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        self.mpv.command(&args).is_ok()
     }
 
     /// Sets an mpv property; a failure is logged (without the value).

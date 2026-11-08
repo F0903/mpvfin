@@ -310,22 +310,27 @@ struct PartnerHttp {
 }
 
 impl PartnerHttp {
-    fn post(&self, path: &str, body: &Value) {
+    fn try_post(&self, path: &str, body: &Value) -> Result<(), String> {
         let url = self.base.join(path);
         self.agent
             .post(&url)
             .header("Authorization", &self.auth)
             .send_json(body)
-            .unwrap_or_else(|e| panic!("POST {url}: {e}"));
+            .map(drop)
+            .map_err(|e| format!("POST {url}: {e}"))
+    }
+
+    fn post(&self, path: &str, body: &Value) {
+        self.try_post(path, body).unwrap_or_else(|e| panic!("{e}"));
     }
 
     /// Answers a load or seek like a well-behaved client: ping, then `Ready` at `position`.
-    fn ready(&self, pid: &str, position: u64) {
-        self.post("/SyncPlay/Ping", &json!({"Ping": 10}));
-        self.post(
+    fn ready(&self, pid: &str, position: u64) -> Result<(), String> {
+        self.try_post("/SyncPlay/Ping", &json!({"Ping": 10}))?;
+        self.try_post(
             "/SyncPlay/Ready",
             &json!({"When": utc_now(), "PositionTicks": position, "IsPlaying": false, "PlaylistItemId": pid}),
-        );
+        )
     }
 }
 
@@ -340,6 +345,8 @@ struct InboxState {
     /// `(MessageType, Data)` not yet consumed by a `wait_*`.
     messages: VecDeque<(String, Value)>,
     queue: Value,
+    /// The first reader or auto-`Ready` failure; `wait_*` and `Drop` panic with it.
+    failure: Option<String>,
 }
 
 impl Partner {
@@ -423,13 +430,21 @@ impl Partner {
             .post("/SyncPlay/Seek", &json!({"PositionTicks": ticks(position)}));
     }
 
-    /// The next unconsumed `SyncPlayGroupUpdate` of `kind`: `{"GroupId","Data","Type"}`.
+    /// Discards every message received so far. Call it before the action whose result you
+    /// assert on, so an older message cannot satisfy a `wait_*`.
+    pub fn clear(&self) {
+        self.inbox.state.lock().expect("inbox").messages.clear();
+    }
+
+    /// The oldest unconsumed `SyncPlayGroupUpdate` of `kind`: `{"GroupId","Data","Type"}`.
+    /// Panics on a timeout or a reader failure.
     #[track_caller]
     pub fn wait_update(&self, kind: &str, timeout: Duration) -> Value {
         self.wait("SyncPlayGroupUpdate", "Type", kind, timeout)
     }
 
-    /// The next unconsumed `SyncPlayCommand` whose `Command` is `kind`.
+    /// The oldest unconsumed `SyncPlayCommand` whose `Command` is `kind`. Panics like
+    /// `wait_update`.
     #[track_caller]
     pub fn wait_command(&self, kind: &str, timeout: Duration) -> Value {
         self.wait("SyncPlayCommand", "Command", kind, timeout)
@@ -445,6 +460,9 @@ impl Partner {
         let deadline = Instant::now() + timeout;
         let mut state = self.inbox.state.lock().expect("inbox");
         loop {
+            if let Some(failure) = &state.failure {
+                panic!("partner failed: {failure}");
+            }
             let found = state
                 .messages
                 .iter()
@@ -470,6 +488,10 @@ impl Drop for Partner {
         if let Some(reader) = self.reader.take() {
             let _ = reader.join();
         }
+        let failure = self.inbox.state.lock().expect("inbox").failure.take();
+        if let (Some(failure), false) = (failure, thread::panicking()) {
+            panic!("partner failed: {failure}");
+        }
     }
 }
 
@@ -492,7 +514,13 @@ fn partner_reader(mut socket: PartnerSocket, http: &PartnerHttp, inbox: &Inbox, 
                     e.kind(),
                     std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
                 ) => {}
-            Err(_) => break,
+            Err(e) => {
+                // An error while stopping comes from our own Drop, not from the server.
+                if !stop.load(Ordering::SeqCst) {
+                    partner_fail(inbox, format!("WebSocket: {e}"));
+                }
+                break;
+            }
         }
     }
     let _ = socket.close(None);
@@ -523,12 +551,23 @@ fn partner_handle(message: &Value, http: &PartnerHttp, inbox: &Inbox) {
         state.messages.push_back((kind.to_owned(), data));
         inbox.changed.notify_all();
     }
-    if let (true, Some((pid, position))) = (inbox.auto_ready.load(Ordering::SeqCst), ready) {
-        // A failed Ready shows up as the test's own timeout; the reader must not die on it.
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            http.ready(&pid, position);
-        }));
+    let Some((pid, position)) = ready.filter(|_| inbox.auto_ready.load(Ordering::SeqCst)) else {
+        return;
+    };
+    if let Err(e) = http.ready(&pid, position) {
+        partner_fail(inbox, format!("auto-Ready: {e}"));
     }
+}
+
+/// Records the first failure and wakes any waiter.
+fn partner_fail(inbox: &Inbox, failure: String) {
+    inbox
+        .state
+        .lock()
+        .expect("inbox")
+        .failure
+        .get_or_insert(failure);
+    inbox.changed.notify_all();
 }
 
 /// Now in UTC as `2026-11-08T20:09:51.398Z`, which is what `When` takes.

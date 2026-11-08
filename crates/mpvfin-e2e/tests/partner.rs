@@ -29,6 +29,8 @@ fn two_partners_can_start_a_group() {
     second.join(&group);
     second.wait_update("GroupJoined", T10);
 
+    first.clear();
+    second.clear();
     first.set_new_queue(&[&episode], 0, Duration::ZERO);
     wait_state(&first, "Playing");
     wait_state(&second, "Playing");

@@ -71,6 +71,9 @@ always wins. To skip with a key of your choice, add this to `input.conf`:
 F5 script-binding mpvfin/skip
 ```
 
+If your `mpv.conf` sets `input-default-bindings=no`, the default Enter hotkey is
+off too; `script-binding mpvfin/skip` still works.
+
 Your Jellyfin server needs a media segment provider plugin; without one it has
 no segments and the button never appears.
 

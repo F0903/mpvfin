@@ -2,7 +2,14 @@
 //!
 //! The core deliberately performs no I/O. Adapters submit [`ReceiverEvent`]s
 //! and execute the returned [`ReceiverAction`]s.
+//!
+//! Casts become `mpvfin://<itemId>` entries in mpv's own playlist. An mpv
+//! load hook reports each entry as it starts ([`ReceiverEvent::PlayerOpening`]);
+//! the reducer asks for Jellyfin negotiation and must continue every hook
+//! exactly once ([`ReceiverAction::ContinueLoad`] or
+//! [`ReceiverAction::AbortLoad`]).
 
+use std::fmt;
 use std::mem;
 use std::time::Duration;
 
@@ -27,13 +34,117 @@ impl Generation {
     }
 }
 
-/// A remote request to start one Jellyfin item.
+/// A string that must never appear in logs; its `Debug` output is redacted.
+#[derive(Clone, Eq, PartialEq)]
+pub struct Secret(String);
+
+impl Secret {
+    /// Wraps a sensitive value.
+    #[must_use]
+    pub const fn new(s: String) -> Self {
+        Self(s)
+    }
+
+    /// Returns the sensitive value.
+    #[must_use]
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for Secret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Secret(***)")
+    }
+}
+
+/// Where queued items go relative to mpv's playlist.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QueueMode {
+    /// Replace the playlist and start playing.
+    Replace,
+    /// Insert after the current entry.
+    Next,
+    /// Append to the end.
+    Last,
+}
+
+/// Jellyfin stream indices chosen by a controller.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct StreamSelection {
+    /// Jellyfin audio stream index.
+    pub audio: Option<i32>,
+    /// Jellyfin subtitle stream index; -1 means off.
+    pub subtitle: Option<i32>,
+}
+
+/// A remote request to queue Jellyfin items.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PlayRequest {
-    /// Jellyfin item identifier.
-    pub item_id: String,
-    /// Requested starting position.
+pub struct QueueRequest {
+    /// Jellyfin item identifiers, in order.
+    pub item_ids: Vec<String>,
+    /// Where to put the items.
+    pub mode: QueueMode,
+    /// Index of the item to start; `Replace` only, clamped to the last item.
+    pub start_index: usize,
+    /// Starting position of the start item; `Replace` only.
     pub start_position: Duration,
+    /// Stream selection for the start item; `Replace` only.
+    pub selection: StreamSelection,
+}
+
+/// Identifies the mpv playlist entry and load hook of an opening item.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PlayerToken {
+    /// mpv playlist entry identifier.
+    pub entry_id: i64,
+    /// mpv load-hook identifier, to be continued exactly once.
+    pub hook_id: u64,
+}
+
+/// Jellyfin stream indices in mpv track order; the mpv id is position + 1.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct TrackMap {
+    /// Jellyfin audio stream indices.
+    pub audio: Vec<i32>,
+    /// Jellyfin subtitle stream indices (embedded, then external).
+    pub subtitles: Vec<i32>,
+}
+
+impl TrackMap {
+    fn mpv_id(list: &[i32], index: i32) -> Option<i64> {
+        let position = list.iter().position(|&i| i == index)?;
+        i64::try_from(position).ok().map(|p| p + 1)
+    }
+
+    fn jellyfin_index(list: &[i32], mpv_id: i64) -> Option<i32> {
+        let position = usize::try_from(mpv_id.checked_sub(1)?).ok()?;
+        list.get(position).copied()
+    }
+
+    /// Maps a Jellyfin audio index to an mpv audio track id.
+    #[must_use]
+    pub fn mpv_audio_id(&self, index: i32) -> Option<i64> {
+        Self::mpv_id(&self.audio, index)
+    }
+
+    /// Maps a Jellyfin subtitle index to an mpv subtitle track id.
+    #[must_use]
+    pub fn mpv_subtitle_id(&self, index: i32) -> Option<i64> {
+        Self::mpv_id(&self.subtitles, index)
+    }
+
+    /// Maps an mpv audio track id to a Jellyfin audio index.
+    #[must_use]
+    pub fn jellyfin_audio_index(&self, mpv_id: i64) -> Option<i32> {
+        Self::jellyfin_index(&self.audio, mpv_id)
+    }
+
+    /// Maps an mpv subtitle track id to a Jellyfin subtitle index.
+    #[must_use]
+    pub fn jellyfin_subtitle_index(&self, mpv_id: i64) -> Option<i32> {
+        Self::jellyfin_index(&self.subtitles, mpv_id)
+    }
 }
 
 /// How Jellyfin decided to deliver the media.
@@ -52,14 +163,22 @@ pub enum PlayMethod {
 pub struct ResolvedMedia {
     /// Jellyfin item identifier.
     pub item_id: String,
-    /// URL or local path passed to mpv.
+    /// Credential-free stream URL passed to mpv.
     pub uri: String,
+    /// Display title.
+    pub title: String,
     /// Jellyfin playback-session identifier.
     pub play_session_id: String,
     /// Selected Jellyfin media-source identifier.
     pub media_source_id: String,
     /// Delivery method selected by Jellyfin.
     pub play_method: PlayMethod,
+    /// Full header line: `Authorization: MediaBrowser Token="..."`.
+    pub auth_header: Secret,
+    /// Credential-free external subtitle URLs, after the embedded subtitles.
+    pub external_subtitles: Vec<String>,
+    /// Jellyfin/mpv track correspondence.
+    pub tracks: TrackMap,
 }
 
 /// A stable view used for Jellyfin lifecycle reports.
@@ -83,17 +202,30 @@ pub struct PlaybackSnapshot {
     pub volume_percent: u8,
     /// Last player-confirmed mute state.
     pub muted: bool,
+    /// Last player-confirmed Jellyfin audio stream index.
+    pub audio_stream_index: Option<i32>,
+    /// Last player-confirmed Jellyfin subtitle stream index; `None` is off.
+    pub subtitle_stream_index: Option<i32>,
 }
 
-/// Why an active or resolved playback was terminated.
+/// Why mpv ended an entry.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum EndReason {
+    /// Natural end of file.
+    Eof,
+    /// Stopped or replaced.
+    Stopped,
+    /// Failed; the message carries no credentials or URLs.
+    Failed(String),
+}
+
+/// Why a playback report says playback stopped.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StopReason {
-    /// A remote controller requested stop.
-    Remote,
-    /// A newer play request replaced this playback.
-    Replaced,
     /// mpv reached the natural end of the item.
     Ended,
+    /// The item was stopped or replaced.
+    Stopped,
     /// mpv failed while loading or playing the item.
     Failed,
     /// The receiver is shutting down.
@@ -106,21 +238,23 @@ pub enum PlaybackState {
     /// No item is being resolved or played.
     #[default]
     Idle,
-    /// Jellyfin playback negotiation is in progress.
+    /// Jellyfin negotiation is in progress and the load hook is held.
     Resolving {
         /// Playback generation.
         generation: Generation,
-        /// Original remote request.
-        request: PlayRequest,
+        /// Entry and hook being resolved.
+        token: PlayerToken,
+        /// Jellyfin item identifier.
+        item_id: String,
+        /// Requested stream selection.
+        selection: StreamSelection,
     },
-    /// mpv was told to load a negotiated item and has not confirmed it yet.
+    /// The hook was continued and mpv has not confirmed the load yet.
     Loading {
         /// Playback generation.
         generation: Generation,
         /// Negotiated media.
         media: ResolvedMedia,
-        /// Requested starting position.
-        start_position: Duration,
     },
     /// mpv confirmed that the negotiated item loaded.
     Playing(PlaybackSnapshot),
@@ -129,8 +263,39 @@ pub enum PlaybackState {
 /// An input to the receiver reducer.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ReceiverEvent {
-    /// A controller requested a new item.
-    RemotePlay(PlayRequest),
+    /// A controller requested items be queued.
+    RemotePlay(QueueRequest),
+    /// A controller requested the next playlist entry.
+    RemoteNext,
+    /// A controller requested the previous playlist entry.
+    RemotePrevious,
+    /// A controller requested pause.
+    RemotePause,
+    /// A controller requested resume.
+    RemoteResume,
+    /// A controller requested a pause toggle.
+    RemoteTogglePause,
+    /// A controller requested an absolute seek.
+    RemoteSeek(Duration),
+    /// A controller requested stop.
+    RemoteStop,
+    /// A controller requested a volume.
+    RemoteSetVolume(u8),
+    /// A controller requested a mute state.
+    RemoteSetMuted(bool),
+    /// A controller requested a mute toggle.
+    RemoteToggleMute,
+    /// A controller requested a Jellyfin audio stream.
+    RemoteSetAudioStream(i32),
+    /// A controller requested a Jellyfin subtitle stream (-1 is off).
+    RemoteSetSubtitleStream(i32),
+    /// mpv is starting a playlist entry and holds its load hook.
+    PlayerOpening {
+        /// Entry and hook identifiers.
+        token: PlayerToken,
+        /// Jellyfin item identifier from the entry URL.
+        item_id: String,
+    },
     /// Jellyfin playback negotiation succeeded.
     MediaResolved {
         /// Generation attached to the request.
@@ -149,13 +314,6 @@ pub enum ReceiverEvent {
     PlayerFileLoaded {
         /// Playback generation.
         generation: Generation,
-    },
-    /// mpv failed to load or continue this generation.
-    PlayerFailed {
-        /// Playback generation.
-        generation: Generation,
-        /// Human-readable error without credentials or playback URLs.
-        message: String,
     },
     /// mpv confirmed a new playback position.
     PlayerPositionChanged {
@@ -187,23 +345,22 @@ pub enum ReceiverEvent {
         /// Confirmed state.
         muted: bool,
     },
-    /// mpv reached the natural end of the item.
+    /// mpv confirmed the selected tracks.
+    PlayerTracksChanged {
+        /// Playback generation.
+        generation: Generation,
+        /// Confirmed Jellyfin audio index.
+        audio_stream_index: Option<i32>,
+        /// Confirmed Jellyfin subtitle index; `None` is off.
+        subtitle_stream_index: Option<i32>,
+    },
+    /// mpv ended the entry.
     PlayerEnded {
         /// Playback generation.
         generation: Generation,
+        /// Why it ended.
+        reason: EndReason,
     },
-    /// A controller requested pause.
-    RemotePause,
-    /// A controller requested resume.
-    RemoteResume,
-    /// A controller requested an absolute seek.
-    RemoteSeek(Duration),
-    /// A controller requested stop.
-    RemoteStop,
-    /// A controller requested a volume.
-    RemoteSetVolume(u8),
-    /// A controller requested a mute state.
-    RemoteSetMuted(bool),
     /// Periodic lifecycle-reporting tick.
     ProgressTick,
     /// Receiver shutdown.
@@ -213,26 +370,36 @@ pub enum ReceiverEvent {
 /// A side effect for an adapter to execute.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ReceiverAction {
+    /// Add `mpvfin://` entries to mpv's playlist.
+    QueueItems(QueueRequest),
+    /// Advance mpv's playlist.
+    PlaylistNext,
+    /// Step back in mpv's playlist.
+    PlaylistPrevious,
     /// Ask Jellyfin to negotiate playback.
     ResolveMedia {
         /// New playback generation.
         generation: Generation,
-        /// Remote request.
-        request: PlayRequest,
+        /// Entry and hook being resolved.
+        token: PlayerToken,
+        /// Jellyfin item identifier.
+        item_id: String,
     },
-    /// Cancel obsolete Jellyfin negotiation work.
-    CancelMediaResolution {
-        /// Obsolete generation.
-        generation: Generation,
-    },
-    /// Load negotiated media into mpv.
-    LoadPlayer {
+    /// Continue the held load hook with the negotiated media.
+    ContinueLoad {
         /// Playback generation.
         generation: Generation,
+        /// Hook to continue.
+        hook_id: u64,
         /// Negotiated media.
         media: ResolvedMedia,
-        /// Requested starting position.
-        start_position: Duration,
+        /// Stream selection for this entry.
+        selection: StreamSelection,
+    },
+    /// Continue the held load hook without media, failing the entry.
+    AbortLoad {
+        /// Hook to continue.
+        hook_id: u64,
     },
     /// Set mpv pause state.
     SetPaused {
@@ -262,7 +429,21 @@ pub enum ReceiverAction {
         /// Requested state.
         muted: bool,
     },
-    /// Stop mpv for the current generation.
+    /// Select a Jellyfin audio stream.
+    SetAudioStream {
+        /// Playback generation.
+        generation: Generation,
+        /// Jellyfin audio index.
+        index: i32,
+    },
+    /// Select a Jellyfin subtitle stream (-1 is off).
+    SetSubtitleStream {
+        /// Playback generation.
+        generation: Generation,
+        /// Jellyfin subtitle index.
+        index: i32,
+    },
+    /// Stop mpv playback for the current generation.
     StopPlayer {
         /// Playback generation.
         generation: Generation,
@@ -294,6 +475,9 @@ pub enum ReceiverAction {
 pub struct Receiver {
     next_generation: u64,
     playback: PlaybackState,
+    /// Selection for the start item of the last `Replace`, consumed by the
+    /// first matching `PlayerOpening`.
+    pending_selection: Option<(String, StreamSelection)>,
 }
 
 impl Default for Receiver {
@@ -309,6 +493,7 @@ impl Receiver {
         Self {
             next_generation: 1,
             playback: PlaybackState::Idle,
+            pending_selection: None,
         }
     }
 
@@ -327,34 +512,61 @@ impl Receiver {
 
         match event {
             ReceiverEvent::RemotePlay(request) => {
-                self.terminate_current(StopReason::Replaced, &mut actions);
+                self.pending_selection = match request.mode {
+                    QueueMode::Replace if request.selection != StreamSelection::default() => {
+                        let last = request.item_ids.len().checked_sub(1);
+                        last.map(|last| {
+                            (
+                                request.item_ids[request.start_index.min(last)].clone(),
+                                request.selection,
+                            )
+                        })
+                    }
+                    _ => None,
+                };
+                actions.push(ReceiverAction::QueueItems(request));
+            }
+            ReceiverEvent::RemoteNext => actions.push(ReceiverAction::PlaylistNext),
+            ReceiverEvent::RemotePrevious => actions.push(ReceiverAction::PlaylistPrevious),
+            ReceiverEvent::PlayerOpening { token, item_id } => {
+                self.terminate_current(StopReason::Stopped, &mut actions);
                 let generation = self.allocate_generation();
+                let selection = match self.pending_selection.take() {
+                    Some((id, selection)) if id == item_id => selection,
+                    other => {
+                        self.pending_selection = other;
+                        StreamSelection::default()
+                    }
+                };
                 self.playback = PlaybackState::Resolving {
                     generation,
-                    request: request.clone(),
+                    token,
+                    item_id: item_id.clone(),
+                    selection,
                 };
                 actions.push(ReceiverAction::ResolveMedia {
                     generation,
-                    request,
+                    token,
+                    item_id,
                 });
             }
             ReceiverEvent::MediaResolved { generation, media } => {
-                let previous = mem::take(&mut self.playback);
-                match previous {
+                match mem::take(&mut self.playback) {
                     PlaybackState::Resolving {
                         generation: expected,
-                        request,
+                        token,
+                        selection,
+                        ..
                     } if expected == generation => {
-                        let start_position = request.start_position;
                         self.playback = PlaybackState::Loading {
                             generation,
                             media: media.clone(),
-                            start_position,
                         };
-                        actions.push(ReceiverAction::LoadPlayer {
+                        actions.push(ReceiverAction::ContinueLoad {
                             generation,
+                            hook_id: token.hook_id,
                             media,
-                            start_position,
+                            selection,
                         });
                     }
                     other => self.playback = other,
@@ -363,76 +575,35 @@ impl Receiver {
             ReceiverEvent::MediaResolutionFailed {
                 generation,
                 message,
-            } => {
-                let previous = mem::take(&mut self.playback);
-                match previous {
-                    PlaybackState::Resolving {
-                        generation: expected,
-                        request,
-                    } if expected == generation => {
-                        actions.push(ReceiverAction::PlaybackFailed {
-                            generation,
-                            item_id: request.item_id,
-                            message,
-                        });
-                    }
-                    other => self.playback = other,
+            } => match mem::take(&mut self.playback) {
+                PlaybackState::Resolving {
+                    generation: expected,
+                    token,
+                    item_id,
+                    ..
+                } if expected == generation => {
+                    actions.push(ReceiverAction::AbortLoad {
+                        hook_id: token.hook_id,
+                    });
+                    actions.push(ReceiverAction::PlaybackFailed {
+                        generation,
+                        item_id,
+                        message,
+                    });
                 }
-            }
-            ReceiverEvent::PlayerFileLoaded { generation } => {
-                let previous = mem::take(&mut self.playback);
-                match previous {
-                    PlaybackState::Loading {
-                        generation: expected,
-                        media,
-                        start_position,
-                    } if expected == generation => {
-                        let snapshot = Self::initial_snapshot(generation, &media, start_position);
-                        self.playback = PlaybackState::Playing(snapshot.clone());
-                        actions.push(ReceiverAction::ReportStarted(snapshot));
-                    }
-                    other => self.playback = other,
+                other => self.playback = other,
+            },
+            ReceiverEvent::PlayerFileLoaded { generation } => match mem::take(&mut self.playback) {
+                PlaybackState::Loading {
+                    generation: expected,
+                    media,
+                } if expected == generation => {
+                    let snapshot = Self::initial_snapshot(generation, &media);
+                    self.playback = PlaybackState::Playing(snapshot.clone());
+                    actions.push(ReceiverAction::ReportStarted(snapshot));
                 }
-            }
-            ReceiverEvent::PlayerFailed {
-                generation,
-                message,
-            } => {
-                let previous = mem::take(&mut self.playback);
-                match previous {
-                    PlaybackState::Loading {
-                        generation: expected,
-                        media,
-                        start_position,
-                    } if expected == generation => {
-                        let snapshot = Self::initial_snapshot(generation, &media, start_position);
-                        actions.push(ReceiverAction::StopPlayer { generation });
-                        actions.push(ReceiverAction::ReportStopped {
-                            snapshot,
-                            reason: StopReason::Failed,
-                        });
-                        actions.push(ReceiverAction::PlaybackFailed {
-                            generation,
-                            item_id: media.item_id,
-                            message,
-                        });
-                    }
-                    PlaybackState::Playing(snapshot) if snapshot.generation == generation => {
-                        let item_id = snapshot.item_id.clone();
-                        actions.push(ReceiverAction::StopPlayer { generation });
-                        actions.push(ReceiverAction::ReportStopped {
-                            snapshot,
-                            reason: StopReason::Failed,
-                        });
-                        actions.push(ReceiverAction::PlaybackFailed {
-                            generation,
-                            item_id,
-                            message,
-                        });
-                    }
-                    other => self.playback = other,
-                }
-            }
+                other => self.playback = other,
+            },
             ReceiverEvent::PlayerPositionChanged {
                 generation,
                 position,
@@ -473,13 +644,48 @@ impl Receiver {
                     actions.push(ReceiverAction::ReportProgress(snapshot.clone()));
                 }
             }
-            ReceiverEvent::PlayerEnded { generation } => {
+            ReceiverEvent::PlayerTracksChanged {
+                generation,
+                audio_stream_index,
+                subtitle_stream_index,
+            } => {
+                if let Some(snapshot) = self.playing_mut(generation)
+                    && (snapshot.audio_stream_index != audio_stream_index
+                        || snapshot.subtitle_stream_index != subtitle_stream_index)
+                {
+                    snapshot.audio_stream_index = audio_stream_index;
+                    snapshot.subtitle_stream_index = subtitle_stream_index;
+                    actions.push(ReceiverAction::ReportProgress(snapshot.clone()));
+                }
+            }
+            ReceiverEvent::PlayerEnded { generation, reason } => {
                 if self.current_generation() == Some(generation) {
-                    self.terminate_current(StopReason::Ended, &mut actions);
+                    let stop = match &reason {
+                        EndReason::Eof => StopReason::Ended,
+                        EndReason::Stopped => StopReason::Stopped,
+                        EndReason::Failed(_) => StopReason::Failed,
+                    };
+                    let item_id = self.current_item_id();
+                    self.terminate_current(stop, &mut actions);
+                    if let (EndReason::Failed(message), Some(item_id)) = (reason, item_id)
+                        && !matches!(actions.first(), Some(ReceiverAction::AbortLoad { .. }))
+                    {
+                        actions.push(ReceiverAction::PlaybackFailed {
+                            generation,
+                            item_id,
+                            message,
+                        });
+                    }
                 }
             }
             ReceiverEvent::RemotePause => self.control_pause(true, &mut actions),
             ReceiverEvent::RemoteResume => self.control_pause(false, &mut actions),
+            ReceiverEvent::RemoteTogglePause => {
+                if let PlaybackState::Playing(snapshot) = &self.playback {
+                    let paused = !snapshot.paused;
+                    self.control_pause(paused, &mut actions);
+                }
+            }
             ReceiverEvent::RemoteSeek(position) => {
                 if let Some(generation) = self.playing_generation() {
                     actions.push(ReceiverAction::Seek {
@@ -488,9 +694,24 @@ impl Receiver {
                     });
                 }
             }
-            ReceiverEvent::RemoteStop => {
-                self.terminate_current(StopReason::Remote, &mut actions);
-            }
+            ReceiverEvent::RemoteStop => match &self.playback {
+                PlaybackState::Idle => {}
+                PlaybackState::Loading { generation, .. } => {
+                    actions.push(ReceiverAction::StopPlayer {
+                        generation: *generation,
+                    });
+                }
+                PlaybackState::Playing(snapshot) => {
+                    actions.push(ReceiverAction::StopPlayer {
+                        generation: snapshot.generation,
+                    });
+                }
+                PlaybackState::Resolving { generation, .. } => {
+                    let generation = *generation;
+                    self.terminate_current(StopReason::Stopped, &mut actions);
+                    actions.push(ReceiverAction::StopPlayer { generation });
+                }
+            },
             ReceiverEvent::RemoteSetVolume(volume_percent) => {
                 if let Some(generation) = self.playing_generation() {
                     actions.push(ReceiverAction::SetVolume {
@@ -502,6 +723,24 @@ impl Receiver {
             ReceiverEvent::RemoteSetMuted(muted) => {
                 if let Some(generation) = self.playing_generation() {
                     actions.push(ReceiverAction::SetMuted { generation, muted });
+                }
+            }
+            ReceiverEvent::RemoteToggleMute => {
+                if let PlaybackState::Playing(snapshot) = &self.playback {
+                    actions.push(ReceiverAction::SetMuted {
+                        generation: snapshot.generation,
+                        muted: !snapshot.muted,
+                    });
+                }
+            }
+            ReceiverEvent::RemoteSetAudioStream(index) => {
+                if let Some(generation) = self.playing_generation() {
+                    actions.push(ReceiverAction::SetAudioStream { generation, index });
+                }
+            }
+            ReceiverEvent::RemoteSetSubtitleStream(index) => {
+                if let Some(generation) = self.playing_generation() {
+                    actions.push(ReceiverAction::SetSubtitleStream { generation, index });
                 }
             }
             ReceiverEvent::ProgressTick => {
@@ -526,21 +765,19 @@ impl Receiver {
         generation
     }
 
-    fn initial_snapshot(
-        generation: Generation,
-        media: &ResolvedMedia,
-        position: Duration,
-    ) -> PlaybackSnapshot {
+    fn initial_snapshot(generation: Generation, media: &ResolvedMedia) -> PlaybackSnapshot {
         PlaybackSnapshot {
             generation,
             item_id: media.item_id.clone(),
             play_session_id: media.play_session_id.clone(),
             media_source_id: media.media_source_id.clone(),
             play_method: media.play_method,
-            position,
+            position: Duration::ZERO,
             paused: false,
             volume_percent: 100,
             muted: false,
+            audio_stream_index: None,
+            subtitle_stream_index: None,
         }
     }
 
@@ -567,33 +804,38 @@ impl Receiver {
         }
     }
 
+    fn current_item_id(&self) -> Option<String> {
+        match &self.playback {
+            PlaybackState::Idle => None,
+            PlaybackState::Resolving { item_id, .. } => Some(item_id.clone()),
+            PlaybackState::Loading { media, .. } => Some(media.item_id.clone()),
+            PlaybackState::Playing(snapshot) => Some(snapshot.item_id.clone()),
+        }
+    }
+
     fn control_pause(&self, paused: bool, actions: &mut Vec<ReceiverAction>) {
         if let Some(generation) = self.playing_generation() {
             actions.push(ReceiverAction::SetPaused { generation, paused });
         }
     }
 
+    /// Goes idle. Resolving continues its hook with an abort; Loading and
+    /// Playing report a stop. mpv owns the actual entry, so no `StopPlayer`.
     fn terminate_current(&mut self, reason: StopReason, actions: &mut Vec<ReceiverAction>) {
         match mem::take(&mut self.playback) {
             PlaybackState::Idle => {}
-            PlaybackState::Resolving { generation, .. } => {
-                actions.push(ReceiverAction::CancelMediaResolution { generation });
+            PlaybackState::Resolving { token, .. } => {
+                actions.push(ReceiverAction::AbortLoad {
+                    hook_id: token.hook_id,
+                });
             }
-            PlaybackState::Loading {
-                generation,
-                media,
-                start_position,
-            } => {
-                actions.push(ReceiverAction::StopPlayer { generation });
+            PlaybackState::Loading { generation, media } => {
                 actions.push(ReceiverAction::ReportStopped {
-                    snapshot: Self::initial_snapshot(generation, &media, start_position),
+                    snapshot: Self::initial_snapshot(generation, &media),
                     reason,
                 });
             }
             PlaybackState::Playing(snapshot) => {
-                actions.push(ReceiverAction::StopPlayer {
-                    generation: snapshot.generation,
-                });
                 actions.push(ReceiverAction::ReportStopped { snapshot, reason });
             }
         }
@@ -604,235 +846,436 @@ impl Receiver {
 mod tests {
     use super::*;
 
-    fn request(item_id: &str, seconds: u64) -> PlayRequest {
-        PlayRequest {
-            item_id: item_id.to_owned(),
-            start_position: Duration::from_secs(seconds),
+    fn gen_(n: u64) -> Generation {
+        Generation::new(n).unwrap()
+    }
+
+    fn token(entry_id: i64, hook_id: u64) -> PlayerToken {
+        PlayerToken { entry_id, hook_id }
+    }
+
+    fn queue(
+        ids: &[&str],
+        start_index: usize,
+        secs: u64,
+        selection: StreamSelection,
+    ) -> QueueRequest {
+        QueueRequest {
+            item_ids: ids.iter().map(|s| (*s).to_owned()).collect(),
+            mode: QueueMode::Replace,
+            start_index,
+            start_position: Duration::from_secs(secs),
+            selection,
         }
     }
 
-    fn media(item_id: &str, session: &str) -> ResolvedMedia {
+    fn media(item_id: &str) -> ResolvedMedia {
         ResolvedMedia {
             item_id: item_id.to_owned(),
             uri: format!("https://media.invalid/{item_id}"),
-            play_session_id: session.to_owned(),
+            title: format!("title-{item_id}"),
+            play_session_id: format!("session-{item_id}"),
             media_source_id: format!("source-{item_id}"),
             play_method: PlayMethod::DirectPlay,
+            auth_header: Secret::new("Authorization: MediaBrowser Token=\"tok\"".to_owned()),
+            external_subtitles: Vec::new(),
+            tracks: TrackMap::default(),
         }
     }
 
-    fn begin_playing(receiver: &mut Receiver, item_id: &str) -> Generation {
-        let actions = receiver.handle(ReceiverEvent::RemotePlay(request(item_id, 12)));
-        let generation = match actions.as_slice() {
+    fn open(r: &mut Receiver, item: &str, hook: u64) -> Vec<ReceiverAction> {
+        r.handle(ReceiverEvent::PlayerOpening {
+            token: token(1, hook),
+            item_id: item.to_owned(),
+        })
+    }
+
+    fn resolve(r: &mut Receiver, g: Generation, item: &str) -> Vec<ReceiverAction> {
+        r.handle(ReceiverEvent::MediaResolved {
+            generation: g,
+            media: media(item),
+        })
+    }
+
+    fn begin_playing(r: &mut Receiver, item: &str, hook: u64) -> Generation {
+        let g = match open(r, item, hook).as_slice() {
             [ReceiverAction::ResolveMedia { generation, .. }] => *generation,
-            unexpected => panic!("unexpected actions: {unexpected:?}"),
+            other => panic!("unexpected actions: {other:?}"),
         };
-
-        let actions = receiver.handle(ReceiverEvent::MediaResolved {
-            generation,
-            media: media(item_id, &format!("session-{item_id}")),
-        });
         assert!(matches!(
-            actions.as_slice(),
-            [ReceiverAction::LoadPlayer { .. }]
+            resolve(r, g, item).as_slice(),
+            [ReceiverAction::ContinueLoad { .. }]
         ));
-
-        let actions = receiver.handle(ReceiverEvent::PlayerFileLoaded { generation });
         assert!(matches!(
-            actions.as_slice(),
+            r.handle(ReceiverEvent::PlayerFileLoaded { generation: g })
+                .as_slice(),
             [ReceiverAction::ReportStarted(_)]
         ));
-        generation
+        g
+    }
+
+    fn ended(g: Generation, reason: EndReason) -> ReceiverEvent {
+        ReceiverEvent::PlayerEnded {
+            generation: g,
+            reason,
+        }
+    }
+
+    #[test]
+    fn remote_play_queues_items_without_changing_state() {
+        let mut r = Receiver::new();
+        let req = queue(&["a", "b"], 1, 30, StreamSelection::default());
+        assert_eq!(
+            r.handle(ReceiverEvent::RemotePlay(req.clone())),
+            vec![ReceiverAction::QueueItems(req)]
+        );
+        assert_eq!(r.playback(), &PlaybackState::Idle);
+    }
+
+    #[test]
+    fn opening_entry_starts_resolution_with_fresh_generation() {
+        let mut r = Receiver::new();
+        assert_eq!(
+            open(&mut r, "a", 70),
+            vec![ReceiverAction::ResolveMedia {
+                generation: gen_(1),
+                token: token(1, 70),
+                item_id: "a".into()
+            }]
+        );
+        r.handle(ended(gen_(1), EndReason::Stopped));
+        assert!(matches!(
+            open(&mut r, "b", 71).as_slice(),
+            [ReceiverAction::ResolveMedia { generation, .. }] if *generation == gen_(2)
+        ));
+    }
+
+    #[test]
+    fn resolution_continues_the_pending_hook_with_requested_selection() {
+        let mut r = Receiver::new();
+        let sel = StreamSelection {
+            audio: Some(2),
+            subtitle: Some(-1),
+        };
+        r.handle(ReceiverEvent::RemotePlay(queue(&["a", "b"], 0, 0, sel)));
+        open(&mut r, "a", 70);
+        let actions = resolve(&mut r, gen_(1), "a");
+        assert!(matches!(
+            actions.last(),
+            Some(ReceiverAction::ContinueLoad { hook_id: 70, selection, .. }) if *selection == sel
+        ));
+        let g2 = match open(&mut r, "b", 80).last() {
+            Some(ReceiverAction::ResolveMedia { generation, .. }) => *generation,
+            other => panic!("unexpected actions: {other:?}"),
+        };
+        assert!(matches!(
+            resolve(&mut r, g2, "b").last(),
+            Some(ReceiverAction::ContinueLoad { hook_id: 80, selection, .. })
+                if *selection == StreamSelection::default()
+        ));
     }
 
     #[test]
     fn play_is_reported_only_after_correlated_file_loaded() {
-        let mut receiver = Receiver::new();
-        let actions = receiver.handle(ReceiverEvent::RemotePlay(request("item-a", 12)));
-        let generation = match actions.as_slice() {
-            [ReceiverAction::ResolveMedia { generation, .. }] => *generation,
-            unexpected => panic!("unexpected actions: {unexpected:?}"),
-        };
-
-        let actions = receiver.handle(ReceiverEvent::MediaResolved {
-            generation,
-            media: media("item-a", "session-a"),
-        });
-        assert!(matches!(
-            actions.as_slice(),
-            [ReceiverAction::LoadPlayer { .. }]
-        ));
-        assert!(matches!(receiver.playback(), PlaybackState::Loading { .. }));
-
+        let mut r = Receiver::new();
+        open(&mut r, "a", 70);
+        let actions = resolve(&mut r, gen_(1), "a");
+        assert!(actions.iter().all(|a| !matches!(
+            a,
+            ReceiverAction::ReportStarted(_) | ReceiverAction::ReportProgress(_)
+        )));
+        assert!(matches!(r.playback(), PlaybackState::Loading { .. }));
         assert!(
-            receiver
-                .handle(ReceiverEvent::PlayerFileLoaded {
-                    generation: Generation(generation.get() + 100),
-                })
-                .is_empty()
+            r.handle(ReceiverEvent::PlayerFileLoaded {
+                generation: gen_(101)
+            })
+            .is_empty()
         );
-        assert!(matches!(receiver.playback(), PlaybackState::Loading { .. }));
-
-        let actions = receiver.handle(ReceiverEvent::PlayerFileLoaded { generation });
-        let [ReceiverAction::ReportStarted(snapshot)] = actions.as_slice() else {
+        assert!(matches!(r.playback(), PlaybackState::Loading { .. }));
+        let actions = r.handle(ReceiverEvent::PlayerFileLoaded {
+            generation: gen_(1),
+        });
+        let [ReceiverAction::ReportStarted(s)] = actions.as_slice() else {
             panic!("unexpected actions: {actions:?}");
         };
-        assert_eq!(snapshot.position, Duration::from_secs(12));
-        assert!(matches!(receiver.playback(), PlaybackState::Playing(_)));
+        assert_eq!(s.position, Duration::ZERO);
+        assert!(matches!(r.playback(), PlaybackState::Playing(_)));
     }
 
     #[test]
-    fn stale_media_resolution_is_ignored_after_replacement() {
-        let mut receiver = Receiver::new();
-        let first = match receiver
-            .handle(ReceiverEvent::RemotePlay(request("old", 0)))
-            .as_slice()
-        {
-            [ReceiverAction::ResolveMedia { generation, .. }] => *generation,
-            unexpected => panic!("unexpected actions: {unexpected:?}"),
-        };
-        let second_actions = receiver.handle(ReceiverEvent::RemotePlay(request("new", 0)));
-        let second = match second_actions.as_slice() {
-            [
-                ReceiverAction::CancelMediaResolution {
-                    generation: cancelled,
-                },
-                ReceiverAction::ResolveMedia { generation, .. },
-            ] => {
-                assert_eq!(*cancelled, first);
-                *generation
-            }
-            unexpected => panic!("unexpected actions: {unexpected:?}"),
-        };
-
-        assert!(
-            receiver
-                .handle(ReceiverEvent::MediaResolved {
-                    generation: first,
-                    media: media("old", "old-session"),
-                })
-                .is_empty()
-        );
-        assert!(matches!(
-            receiver.playback(),
-            PlaybackState::Resolving { generation, .. } if *generation == second
-        ));
-    }
-
-    #[test]
-    fn replacing_active_playback_stops_old_generation_once() {
-        let mut receiver = Receiver::new();
-        let old_generation = begin_playing(&mut receiver, "old");
-
-        let actions = receiver.handle(ReceiverEvent::RemotePlay(request("new", 5)));
-        assert_eq!(actions.len(), 3);
-        assert!(matches!(
-            actions[0],
-            ReceiverAction::StopPlayer { generation } if generation == old_generation
-        ));
-        assert!(matches!(
-            &actions[1],
-            ReceiverAction::ReportStopped {
-                snapshot,
-                reason: StopReason::Replaced,
-            } if snapshot.generation == old_generation
-        ));
-
-        assert!(
-            receiver
-                .handle(ReceiverEvent::PlayerEnded {
-                    generation: old_generation,
-                })
-                .is_empty()
-        );
-    }
-
-    #[test]
-    fn remote_stop_reports_exactly_once() {
-        let mut receiver = Receiver::new();
-        let generation = begin_playing(&mut receiver, "item-a");
-
-        let actions = receiver.handle(ReceiverEvent::RemoteStop);
+    fn stale_resolution_is_ignored_after_next_entry_opens() {
+        let mut r = Receiver::new();
+        open(&mut r, "a", 70);
+        let actions = open(&mut r, "b", 80);
         assert!(matches!(
             actions.as_slice(),
             [
-                ReceiverAction::StopPlayer { .. },
-                ReceiverAction::ReportStopped {
-                    reason: StopReason::Remote,
-                    ..
-                }
+                ReceiverAction::AbortLoad { hook_id: 70 },
+                ReceiverAction::ResolveMedia { generation, .. }
+            ] if *generation == gen_(2)
+        ));
+        assert!(resolve(&mut r, gen_(1), "a").is_empty());
+    }
+
+    #[test]
+    fn every_hook_is_continued_exactly_once() {
+        fn count(actions: &[ReceiverAction], hook: u64) -> usize {
+            actions
+                .iter()
+                .filter(|a| {
+                    matches!(a, ReceiverAction::ContinueLoad { hook_id, .. }
+                        | ReceiverAction::AbortLoad { hook_id } if *hook_id == hook)
+                })
+                .count()
+        }
+        // resolved
+        let mut r = Receiver::new();
+        open(&mut r, "a", 70);
+        let all = resolve(&mut r, gen_(1), "a");
+        assert_eq!(count(&all, 70), 1);
+        // resolution failed
+        let mut r = Receiver::new();
+        open(&mut r, "a", 70);
+        let all = r.handle(ReceiverEvent::MediaResolutionFailed {
+            generation: gen_(1),
+            message: "boom".into(),
+        });
+        assert_eq!(count(&all, 70), 1);
+        assert!(matches!(
+            all.as_slice(),
+            [
+                ReceiverAction::AbortLoad { .. },
+                ReceiverAction::PlaybackFailed { .. }
             ]
         ));
-        assert_eq!(receiver.playback(), &PlaybackState::Idle);
-        assert!(receiver.handle(ReceiverEvent::RemoteStop).is_empty());
+        assert_eq!(r.playback(), &PlaybackState::Idle);
+        // superseded
+        let mut r = Receiver::new();
+        let mut all = open(&mut r, "a", 70);
+        all.extend(open(&mut r, "b", 80));
+        all.extend(resolve(&mut r, gen_(1), "a"));
+        all.extend(resolve(&mut r, gen_(2), "b"));
+        assert_eq!(count(&all, 70), 1);
+        assert_eq!(count(&all, 80), 1);
+        // shutdown while resolving
+        let mut r = Receiver::new();
+        let mut all = open(&mut r, "a", 70);
+        all.extend(r.handle(ReceiverEvent::Shutdown));
+        assert_eq!(count(&all, 70), 1);
+    }
+
+    #[test]
+    fn end_of_file_reports_stopped_once_without_stop_command() {
+        let mut r = Receiver::new();
+        let g = begin_playing(&mut r, "a", 70);
+        let actions = r.handle(ended(g, EndReason::Eof));
+        assert!(matches!(
+            actions.as_slice(),
+            [ReceiverAction::ReportStopped {
+                reason: StopReason::Ended,
+                ..
+            }]
+        ));
+        assert!(r.handle(ended(g, EndReason::Eof)).is_empty());
+    }
+
+    #[test]
+    fn remote_stop_stops_player_then_reports_on_end() {
+        let mut r = Receiver::new();
+        let g = begin_playing(&mut r, "a", 70);
+        assert_eq!(
+            r.handle(ReceiverEvent::RemoteStop),
+            vec![ReceiverAction::StopPlayer { generation: g }]
+        );
+        assert!(matches!(
+            r.handle(ended(g, EndReason::Stopped)).as_slice(),
+            [ReceiverAction::ReportStopped {
+                reason: StopReason::Stopped,
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn remote_stop_while_resolving_aborts_hook_and_stops_player() {
+        let mut r = Receiver::new();
+        open(&mut r, "a", 70);
+        assert_eq!(
+            r.handle(ReceiverEvent::RemoteStop),
+            vec![
+                ReceiverAction::AbortLoad { hook_id: 70 },
+                ReceiverAction::StopPlayer {
+                    generation: gen_(1)
+                }
+            ]
+        );
+        assert_eq!(r.playback(), &PlaybackState::Idle);
+    }
+
+    #[test]
+    fn opening_while_playing_reports_stopped_without_stop_command() {
+        let mut r = Receiver::new();
+        let g = begin_playing(&mut r, "a", 70);
+        let actions = open(&mut r, "b", 80);
+        assert!(matches!(
+            actions.as_slice(),
+            [
+                ReceiverAction::ReportStopped { snapshot, reason: StopReason::Stopped },
+                ReceiverAction::ResolveMedia { .. }
+            ] if snapshot.generation == g
+        ));
+    }
+
+    #[test]
+    fn player_failure_reports_failed_stop_and_surfaces_error() {
+        let mut r = Receiver::new();
+        let g = begin_playing(&mut r, "a", 70);
+        let actions = r.handle(ended(g, EndReason::Failed("x".into())));
+        assert!(matches!(
+            actions.as_slice(),
+            [
+                ReceiverAction::ReportStopped { reason: StopReason::Failed, .. },
+                ReceiverAction::PlaybackFailed { message, .. }
+            ] if message == "x"
+        ));
+    }
+
+    #[test]
+    fn toggles_invert_confirmed_state() {
+        let mut r = Receiver::new();
+        let g = begin_playing(&mut r, "a", 70);
+        r.handle(ReceiverEvent::PlayerMuteChanged {
+            generation: g,
+            muted: true,
+        });
+        assert_eq!(
+            r.handle(ReceiverEvent::RemoteTogglePause),
+            vec![ReceiverAction::SetPaused {
+                generation: g,
+                paused: true
+            }]
+        );
+        assert_eq!(
+            r.handle(ReceiverEvent::RemoteToggleMute),
+            vec![ReceiverAction::SetMuted {
+                generation: g,
+                muted: false
+            }]
+        );
+    }
+
+    #[test]
+    fn track_changes_are_reported_only_after_player_confirmation() {
+        let mut r = Receiver::new();
+        let g = begin_playing(&mut r, "a", 70);
+        assert_eq!(
+            r.handle(ReceiverEvent::RemoteSetAudioStream(2)),
+            vec![ReceiverAction::SetAudioStream {
+                generation: g,
+                index: 2
+            }]
+        );
+        let ev = ReceiverEvent::PlayerTracksChanged {
+            generation: g,
+            audio_stream_index: Some(2),
+            subtitle_stream_index: Some(5),
+        };
+        let actions = r.handle(ev.clone());
+        assert!(matches!(
+            actions.as_slice(),
+            [ReceiverAction::ReportProgress(s)]
+                if s.audio_stream_index == Some(2) && s.subtitle_stream_index == Some(5)
+        ));
+        assert!(r.handle(ev).is_empty());
+    }
+
+    #[test]
+    fn stream_commands_and_playlist_commands() {
+        let mut r = Receiver::new();
         assert!(
-            receiver
-                .handle(ReceiverEvent::PlayerEnded { generation })
+            r.handle(ReceiverEvent::RemoteSetSubtitleStream(1))
                 .is_empty()
+        );
+        assert_eq!(
+            r.handle(ReceiverEvent::RemoteNext),
+            vec![ReceiverAction::PlaylistNext]
+        );
+        assert_eq!(
+            r.handle(ReceiverEvent::RemotePrevious),
+            vec![ReceiverAction::PlaylistPrevious]
         );
     }
 
     #[test]
     fn controller_changes_are_reported_only_after_player_confirmation() {
-        let mut receiver = Receiver::new();
-        let generation = begin_playing(&mut receiver, "item-a");
-
+        let mut r = Receiver::new();
+        let g = begin_playing(&mut r, "a", 70);
         assert!(matches!(
-            receiver.handle(ReceiverEvent::RemotePause).as_slice(),
+            r.handle(ReceiverEvent::RemotePause).as_slice(),
             [ReceiverAction::SetPaused { paused: true, .. }]
         ));
-        let actions = receiver.handle(ReceiverEvent::PlayerPauseChanged {
-            generation,
-            paused: true,
-        });
         assert!(matches!(
-            actions.as_slice(),
-            [ReceiverAction::ReportProgress(snapshot)] if snapshot.paused
+            r.handle(ReceiverEvent::PlayerPauseChanged {
+                generation: g,
+                paused: true
+            })
+            .as_slice(),
+            [ReceiverAction::ReportProgress(s)] if s.paused
         ));
-
         assert!(matches!(
-            receiver
-                .handle(ReceiverEvent::RemoteSeek(Duration::from_secs(90)))
+            r.handle(ReceiverEvent::RemoteSeek(Duration::from_secs(90)))
                 .as_slice(),
             [ReceiverAction::Seek { .. }]
         ));
         assert!(
-            receiver
-                .handle(ReceiverEvent::PlayerPositionChanged {
-                    generation,
-                    position: Duration::from_secs(90),
-                    seek_completed: false,
-                })
-                .is_empty()
+            r.handle(ReceiverEvent::PlayerPositionChanged {
+                generation: g,
+                position: Duration::from_secs(90),
+                seek_completed: false,
+            })
+            .is_empty()
         );
         assert!(matches!(
-            receiver
-                .handle(ReceiverEvent::PlayerPositionChanged {
-                    generation,
-                    position: Duration::from_secs(90),
-                    seek_completed: true,
-                })
-                .as_slice(),
-            [ReceiverAction::ReportProgress(snapshot)]
-                if snapshot.position == Duration::from_secs(90)
+            r.handle(ReceiverEvent::PlayerPositionChanged {
+                generation: g,
+                position: Duration::from_secs(90),
+                seek_completed: true,
+            })
+            .as_slice(),
+            [ReceiverAction::ReportProgress(s)] if s.position == Duration::from_secs(90)
         ));
     }
 
     #[test]
-    fn shutdown_cancels_pending_resolution() {
-        let mut receiver = Receiver::new();
-        let generation = match receiver
-            .handle(ReceiverEvent::RemotePlay(request("item-a", 0)))
-            .as_slice()
-        {
-            [ReceiverAction::ResolveMedia { generation, .. }] => *generation,
-            unexpected => panic!("unexpected actions: {unexpected:?}"),
-        };
+    fn shutdown_reports_active_playback_without_stop_command() {
+        let mut r = Receiver::new();
+        begin_playing(&mut r, "a", 70);
+        assert!(matches!(
+            r.handle(ReceiverEvent::Shutdown).as_slice(),
+            [ReceiverAction::ReportStopped {
+                reason: StopReason::Shutdown,
+                ..
+            }]
+        ));
+    }
 
-        assert_eq!(
-            receiver.handle(ReceiverEvent::Shutdown),
-            vec![ReceiverAction::CancelMediaResolution { generation }]
-        );
-        assert_eq!(receiver.playback(), &PlaybackState::Idle);
+    #[test]
+    fn track_map_round_trips_embedded_and_external_indices() {
+        let t = TrackMap {
+            audio: vec![1, 2],
+            subtitles: vec![3, 4, 7],
+        };
+        assert_eq!(t.mpv_audio_id(2), Some(2));
+        assert_eq!(t.mpv_subtitle_id(7), Some(3));
+        assert_eq!(t.jellyfin_subtitle_index(1), Some(3));
+        assert_eq!(t.jellyfin_audio_index(2), Some(2));
+        assert_eq!(t.mpv_audio_id(9), None);
+        assert_eq!(t.jellyfin_audio_index(0), None);
+    }
+
+    #[test]
+    fn secret_debug_is_redacted() {
+        let s = format!("{:?}", Secret::new("tok".into()));
+        assert!(!s.contains("tok"));
     }
 }

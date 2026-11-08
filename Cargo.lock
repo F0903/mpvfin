@@ -9,10 +9,3 @@ version = "0.1.0"
 [[package]]
 name = "mpvfin-cplugin"
 version = "0.1.0"
-
-[[package]]
-name = "mpvfin-mpv"
-version = "0.1.0"
-dependencies = [
- "mpvfin-core",
-]

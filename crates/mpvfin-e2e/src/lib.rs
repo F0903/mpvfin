@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -340,6 +340,13 @@ struct Inbox {
     auto_ready: AtomicBool,
 }
 
+impl Inbox {
+    /// Locks the state; a poisoned lock (a test thread panicked) is still usable.
+    fn lock(&self) -> MutexGuard<'_, InboxState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
 #[derive(Default)]
 struct InboxState {
     /// `(MessageType, Data)` not yet consumed by a `wait_*`.
@@ -433,7 +440,7 @@ impl Partner {
     /// Discards every message received so far. Call it before the action whose result you
     /// assert on, so an older message cannot satisfy a `wait_*`.
     pub fn clear(&self) {
-        self.inbox.state.lock().expect("inbox").messages.clear();
+        self.inbox.lock().messages.clear();
     }
 
     /// The oldest unconsumed `SyncPlayGroupUpdate` of `kind`: `{"GroupId","Data","Type"}`.
@@ -452,15 +459,16 @@ impl Partner {
 
     /// The `Data` of the latest `PlayQueue` update, or null if none arrived.
     pub fn last_queue(&self) -> Value {
-        self.inbox.state.lock().expect("inbox").queue.clone()
+        self.inbox.lock().queue.clone()
     }
 
     #[track_caller]
     fn wait(&self, message: &str, field: &str, kind: &str, timeout: Duration) -> Value {
         let deadline = Instant::now() + timeout;
-        let mut state = self.inbox.state.lock().expect("inbox");
+        let mut state = self.inbox.lock();
         loop {
-            if let Some(failure) = &state.failure {
+            if let Some(failure) = state.failure.clone() {
+                drop(state);
                 panic!("partner failed: {failure}");
             }
             let found = state
@@ -471,12 +479,15 @@ impl Partner {
                 return state.messages.remove(found).expect("found above").1;
             }
             let left = deadline.saturating_duration_since(Instant::now());
-            assert!(!left.is_zero(), "no {message} {kind} within {timeout:?}");
+            if left.is_zero() {
+                drop(state); // panicking with the lock held would poison it
+                panic!("no {message} {kind} within {timeout:?}");
+            }
             state = self
                 .inbox
                 .changed
                 .wait_timeout(state, left)
-                .expect("inbox")
+                .unwrap_or_else(PoisonError::into_inner)
                 .0;
         }
     }
@@ -488,8 +499,11 @@ impl Drop for Partner {
         if let Some(reader) = self.reader.take() {
             let _ = reader.join();
         }
-        let failure = self.inbox.state.lock().expect("inbox").failure.take();
-        if let (Some(failure), false) = (failure, thread::panicking()) {
+        if thread::panicking() {
+            return;
+        }
+        let failure = self.inbox.lock().failure.take();
+        if let Some(failure) = failure {
             panic!("partner failed: {failure}");
         }
     }
@@ -532,7 +546,7 @@ fn partner_handle(message: &Value, http: &PartnerHttp, inbox: &Inbox) {
     let mut ready = None;
     if kind == "SyncPlayGroupUpdate" && data["Type"] == "PlayQueue" {
         let queue = &data["Data"];
-        inbox.state.lock().expect("inbox").queue = queue.clone();
+        inbox.lock().queue = queue.clone();
         let item_changing = ["NewPlaylist", "SetCurrentItem", "NextItem", "PreviousItem"]
             .iter()
             .any(|reason| queue["Reason"] == *reason);
@@ -547,7 +561,7 @@ fn partner_handle(message: &Value, http: &PartnerHttp, inbox: &Inbox) {
         ));
     }
     if let Some(kind) = kind.as_str() {
-        let mut state = inbox.state.lock().expect("inbox");
+        let mut state = inbox.lock();
         state.messages.push_back((kind.to_owned(), data));
         inbox.changed.notify_all();
     }
@@ -561,12 +575,7 @@ fn partner_handle(message: &Value, http: &PartnerHttp, inbox: &Inbox) {
 
 /// Records the first failure and wakes any waiter.
 fn partner_fail(inbox: &Inbox, failure: String) {
-    inbox
-        .state
-        .lock()
-        .expect("inbox")
-        .failure
-        .get_or_insert(failure);
+    inbox.lock().failure.get_or_insert(failure);
     inbox.changed.notify_all();
 }
 

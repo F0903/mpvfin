@@ -34,12 +34,9 @@ const RESOLVE_DEADLINE: Duration = Duration::from_secs(4);
 /// of a double press can't reach mpv's own bindings.
 const SKIP_LINGER: Duration = Duration::from_millis(400);
 
-/// uosc's open-menu marker; present only while a uosc menu is open.
+/// uosc's open-menu marker. It is absent before the first menu, and reads as
+/// the string `null` once a menu has closed.
 const UOSC_MENU: &str = "user-data/uosc/menu/type";
-
-/// How often an open uosc menu is rechecked while a button is up: mpv sends no
-/// change event when a user-data property is deleted, which is how one closes.
-const UOSC_MENU_RECHECK: Duration = Duration::from_millis(250);
 
 /// Runs the plugin until mpv shuts down; the entry point's return value.
 pub fn run(mpv: Mpv) -> c_int {
@@ -97,7 +94,6 @@ pub fn run(mpv: Mpv) -> c_int {
         subtitle_wait: None,
         skip_button: None,
         skip_sections_off_at: None,
-        uosc_menu_recheck_at: None,
     };
     runtime.define_skip_sections();
     runtime.event_loop();
@@ -235,8 +231,6 @@ struct Runtime {
     skip_button: Option<SkipButton>,
     /// When the skip input sections go off; `None` leaves them as they are.
     skip_sections_off_at: Option<Instant>,
-    /// When to look at an open uosc menu again; `None` while none is open.
-    uosc_menu_recheck_at: Option<Instant>,
 }
 
 /// The latest `ResolveMedia`, until the job thread answers it.
@@ -255,14 +249,10 @@ impl Runtime {
                 .as_ref()
                 .filter(|pending| !pending.expired)
                 .map(|pending| pending.deadline);
-            let wake = [
-                resolve,
-                self.skip_sections_off_at,
-                self.uosc_menu_recheck_at,
-            ]
-            .into_iter()
-            .flatten()
-            .fold(next_tick, Instant::min);
+            let wake = [resolve, self.skip_sections_off_at]
+                .into_iter()
+                .flatten()
+                .fold(next_tick, Instant::min);
             let timeout = wake.saturating_duration_since(Instant::now());
             let Some(event) = self.mpv.wait_event(timeout.as_secs_f64()).map(Event::read) else {
                 self.mpv.log("mpv_wait_event returned no event");
@@ -312,12 +302,6 @@ impl Runtime {
             self.drain();
             self.expire_resolve();
             self.expire_skip_sections();
-            if self
-                .uosc_menu_recheck_at
-                .is_some_and(|at| Instant::now() >= at)
-            {
-                self.update_skip_hover();
-            }
             if Instant::now() >= next_tick {
                 next_tick = Instant::now() + TICK;
                 self.feed(ReceiverEvent::ProgressTick);
@@ -705,7 +689,6 @@ impl Runtime {
 
     fn hide_skip_button(&mut self) {
         self.skip_button = None;
-        self.uosc_menu_recheck_at = None;
         self.run(&skip_button::clear_command());
         // At once, unless the press that hid the button pushes this back.
         self.skip_sections_off_at = Some(Instant::now());
@@ -735,8 +718,10 @@ impl Runtime {
             return;
         };
         // uosc's menu draws over the button and owns the click there.
-        let menu_open = self.mpv.get_property(UOSC_MENU).is_some();
-        self.uosc_menu_recheck_at = menu_open.then(|| Instant::now() + UOSC_MENU_RECHECK);
+        let menu_open = self
+            .mpv
+            .get_property(UOSC_MENU)
+            .is_some_and(|menu| menu != "null");
         let hovered = !menu_open && self.pointer_over_skip_button();
         if hovered != button.hovered {
             self.skip_button = Some(SkipButton { hovered, ..button });

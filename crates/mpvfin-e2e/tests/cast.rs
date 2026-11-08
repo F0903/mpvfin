@@ -776,7 +776,8 @@ fn an_open_uosc_menu_keeps_clicks_off_the_button() {
     assert!(c.position() < 20.0, "the click went through the menu");
     assert!(!section_active(&c.player, CLICK_SECTION));
 
-    c.player.command(&["del", "user-data/uosc/menu/type"]);
+    // uosc closes a menu by setting the property to nil, not by deleting it.
+    c.player.set_null("user-data/uosc/menu/type");
     c.wait_click_section(true);
     c.assert_far_from(20.0);
     c.press("MBTN_LEFT");

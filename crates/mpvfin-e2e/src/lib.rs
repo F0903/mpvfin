@@ -473,6 +473,12 @@ impl Player {
         assert_eq!(reply["error"], "success", "{args:?}");
     }
 
+    /// Sets a property to JSON null and requires it to succeed.
+    pub fn set_null(&self, property: &str) {
+        let reply = self.request(&[json!("set_property"), json!(property), Value::Null]);
+        assert_eq!(reply["error"], "success", "set_null {property}");
+    }
+
     /// Waits for a log line containing `needle` and returns it.
     #[track_caller]
     pub fn wait_log(&self, needle: &str, timeout: Duration) -> String {

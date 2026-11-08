@@ -83,7 +83,7 @@ mod tests {
                 Segment {
                     kind: SegmentKind::Outro,
                     start: Duration::from_secs(100),
-                    end: Duration::from_secs(120),
+                    end: Duration::from_mins(2),
                     to_end_of_file: false,
                 },
             ]

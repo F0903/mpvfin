@@ -1,44 +1,17 @@
 //! Minimal native mpv C-plugin entry point.
 //!
 //! This slice proves that the host can initialize mpv's dynamic symbol table,
-//! call the Rust DLL entry point, and drive the plugin event loop. Player
-//! observations and commands will be added behind `mpvfin-mpv` next.
+//! call the Rust DLL entry point, and drive the plugin event loop. The event
+//! loop built on [`mpv`] and [`adapter`] comes next.
 
-use std::ffi::{c_char, c_int, c_void};
+pub mod adapter;
+pub mod ffi;
+pub mod mpv;
+
+use std::ffi::c_int;
 use std::panic::{self, AssertUnwindSafe};
 
-const MPV_EVENT_SHUTDOWN: c_int = 1;
-
-/// Opaque mpv client handle owned by the host.
-#[repr(C)]
-pub struct MpvHandle {
-    _private: [u8; 0],
-}
-
-/// Prefix of mpv's public `mpv_event` structure.
-#[repr(C)]
-pub struct MpvEvent {
-    event_id: c_int,
-    error: c_int,
-    reply_userdata: u64,
-    data: *mut c_void,
-}
-
-type MpvWaitEvent = unsafe extern "C" fn(*mut MpvHandle, f64) -> *const MpvEvent;
-type MpvCommandString = unsafe extern "C" fn(*mut MpvHandle, *const c_char) -> c_int;
-type MpvClientName = unsafe extern "C" fn(*mut MpvHandle) -> *const c_char;
-
-// mpv initializes exported `pfn_mpv_*` slots before calling
-// `mpv_open_cplugin`. This mirrors the public `MPV_CPLUGIN_DYNAMIC_SYM`
-// contract without linking the plugin to a particular mpv.exe or libmpv DLL.
-#[unsafe(no_mangle)]
-pub static mut pfn_mpv_wait_event: Option<MpvWaitEvent> = None;
-
-#[unsafe(no_mangle)]
-pub static mut pfn_mpv_command_string: Option<MpvCommandString> = None;
-
-#[unsafe(no_mangle)]
-pub static mut pfn_mpv_client_name: Option<MpvClientName> = None;
+use ffi::{MPV_EVENT_SHUTDOWN, MpvHandle};
 
 /// Native mpv C-plugin entry point.
 ///
@@ -64,9 +37,9 @@ fn run_plugin(handle: *mut MpvHandle) -> c_int {
     // plugin thread and do not retain references to the mutable statics.
     let (wait_event, command_string, client_name) = unsafe {
         (
-            pfn_mpv_wait_event,
-            pfn_mpv_command_string,
-            pfn_mpv_client_name,
+            ffi::pfn_mpv_wait_event,
+            ffi::pfn_mpv_command_string,
+            ffi::pfn_mpv_client_name,
         )
     };
     let (Some(wait_event), Some(command_string), Some(client_name)) =

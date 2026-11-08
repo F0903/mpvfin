@@ -9,6 +9,10 @@ publish = false
 name = "mpvfin"
 crate-type = ["cdylib"]
 
+[dependencies]
+mpvfin-core = { path = "../mpvfin-core" }
+mpvfin-jellyfin = { path = "../mpvfin-jellyfin" }
+
 [lints]
 workspace = true
 

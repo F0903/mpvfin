@@ -446,16 +446,37 @@ fn rejected_token_falls_back_to_quick_connect() {
 #[ignore = "needs ./scripts/test-server.ps1 -Action up"]
 fn seek_beyond_demuxer_cache_works_through_proxy() {
     let c = cast_with(
-        "cache=no\ndemuxer-max-bytes=64KiB\ndemuxer-max-back-bytes=0\n",
+        "cache=no
+demuxer-max-bytes=512KiB
+demuxer-max-back-bytes=0
+",
         None,
     );
-    c.play_one(&c.items[0], Duration::ZERO);
+    let e01 = c.items[0].as_str();
+    c.play_one(e01, Duration::ZERO);
 
     c.server.playstate(&c.session, "Seek", Some(secs(100)));
-    poll_until(T20, || {
+    let landed = poll_until(T20, || {
         let in_mpv = c.player.get("time-pos").as_f64()?;
         let reported = reported_position(&c.server.mpvfin_session(&c.device)?)?;
         ((98.0..=108.0).contains(&in_mpv) && (secs(98)..=secs(108)).contains(&reported))
-            .then_some(())
+            .then_some(in_mpv)
     });
+
+    // A false EOF would end the item or restart the clock in the next one.
+    poll_until(T10, || {
+        c.player
+            .get("time-pos")
+            .as_f64()
+            .filter(|p| *p >= landed + 1.0)
+    });
+    assert_eq!(c.player.get("eof-reached"), json!(false));
+    let session = c.server.mpvfin_session(&c.device).expect("session");
+    assert_eq!(session["NowPlayingItem"]["Id"], e01, "item stopped playing");
+
+    let (_, log) = c.player.quit_with_log();
+    assert!(
+        !log.contains("Too many packets"),
+        "demuxer overflowed, so this did not test a normal seek"
+    );
 }

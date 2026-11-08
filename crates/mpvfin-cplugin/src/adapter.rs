@@ -122,25 +122,35 @@ pub fn selection_commands(media: &ResolvedMedia, selection: &StreamSelection) ->
     audio.into_iter().chain(subtitle).collect()
 }
 
-/// Asynchronous `sub-add`s still running for a generation; the selection
-/// waits for them because it may name one of their tracks.
+/// What a generation's subtitle setup does next.
+#[derive(Debug, Eq, PartialEq)]
+pub enum SubtitleStep {
+    /// Issue this `sub-add` and wait for its reply.
+    Add(Vec<String>),
+    /// Every subtitle is in; apply the selection.
+    Select(Vec<Vec<String>>),
+}
+
+/// A generation's external subtitles, added one at a time: mpv numbers tracks
+/// in completion order, and `TrackMap` relies on them matching list order. The
+/// selection waits for all of them because it may name one of their tracks.
 pub struct SubtitleWait {
     generation: Generation,
-    remaining: usize,
+    sub_adds: std::vec::IntoIter<Vec<String>>,
     selection: Vec<Vec<String>>,
 }
 
 impl SubtitleWait {
-    /// Waits for `remaining` replies carrying `generation` as their reply id.
+    /// Prepares `sub_adds`, whose replies carry `generation` as their reply id.
     #[must_use]
-    pub const fn new(
+    pub fn new(
         generation: Generation,
-        remaining: usize,
+        sub_adds: Vec<Vec<String>>,
         selection: Vec<Vec<String>>,
     ) -> Self {
         Self {
             generation,
-            remaining,
+            sub_adds: sub_adds.into_iter(),
             selection,
         }
     }
@@ -151,13 +161,18 @@ impl SubtitleWait {
         self.generation
     }
 
-    /// Counts one reply; returns the selection when it was the last.
-    pub fn reply(&mut self, reply_id: u64) -> Option<Vec<Vec<String>>> {
-        if reply_id != self.generation.get() || self.remaining == 0 {
-            return None;
-        }
-        self.remaining -= 1;
-        (self.remaining == 0).then(|| std::mem::take(&mut self.selection))
+    /// Whether a command reply belongs to this generation's `sub-add`s.
+    #[must_use]
+    pub const fn accepts(&self, reply_id: u64) -> bool {
+        reply_id == self.generation.get()
+    }
+
+    /// The next thing to do; call once at the start and once per reply.
+    pub fn step(&mut self) -> SubtitleStep {
+        self.sub_adds.next().map_or_else(
+            || SubtitleStep::Select(std::mem::take(&mut self.selection)),
+            SubtitleStep::Add,
+        )
     }
 }
 
@@ -405,14 +420,28 @@ mod tests {
     }
 
     #[test]
-    fn selection_is_released_once_by_the_last_reply_of_its_generation() {
+    fn subtitles_are_added_in_track_order_then_the_selection_runs() {
         let generation = Generation::new(7).unwrap();
+        let first = cmd(&["sub-add", "http://x/a", "auto"]);
+        let second = cmd(&["sub-add", "http://x/b", "auto"]);
         let selection = vec![cmd(&["set", "file-local-options/sid", "3"])];
-        let mut wait = SubtitleWait::new(generation, 2, selection.clone());
-        assert_eq!(wait.reply(6), None, "another generation's reply");
-        assert_eq!(wait.reply(7), None, "one of two");
-        assert_eq!(wait.reply(7), Some(selection));
-        assert_eq!(wait.reply(7), None, "already released");
+        let mut wait = SubtitleWait::new(
+            generation,
+            vec![first.clone(), second.clone()],
+            selection.clone(),
+        );
+        assert!(!wait.accepts(6), "another generation's reply");
+        assert!(wait.accepts(7));
+        assert_eq!(wait.step(), SubtitleStep::Add(first));
+        assert_eq!(wait.step(), SubtitleStep::Add(second));
+        assert_eq!(wait.step(), SubtitleStep::Select(selection));
+    }
+
+    #[test]
+    fn with_no_external_subtitles_the_selection_runs_at_once() {
+        let selection = vec![cmd(&["set", "file-local-options/aid", "2"])];
+        let mut wait = SubtitleWait::new(Generation::new(7).unwrap(), vec![], selection.clone());
+        assert_eq!(wait.step(), SubtitleStep::Select(selection));
     }
 
     #[test]

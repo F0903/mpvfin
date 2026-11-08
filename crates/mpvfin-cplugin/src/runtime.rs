@@ -13,7 +13,7 @@ use mpvfin_core::{
 };
 use mpvfin_jellyfin::{Job, Paths, Report, SessionEvent, SessionHandle};
 
-use crate::adapter::{self, SubtitleWait, TrackKind};
+use crate::adapter::{self, SubtitleStep, SubtitleWait, TrackKind};
 use crate::ffi::{
     MPV_EVENT_COMMAND_REPLY, MPV_EVENT_END_FILE, MPV_EVENT_FILE_LOADED, MPV_EVENT_HOOK,
     MPV_EVENT_PLAYBACK_RESTART, MPV_EVENT_PROPERTY_CHANGE, MPV_EVENT_SHUTDOWN,
@@ -246,8 +246,9 @@ impl Runtime {
     fn shutdown(mut self) -> c_int {
         self.feed(ReceiverEvent::Shutdown);
         self.mpv.waker().disarm();
-        // Jobs run in order and playback needs its resolve answered, so behind
-        // a resolve stuck past its deadline there is no report to wait for.
+        // shortcut: a stop report queued behind a stalled request is dropped
+        // here, losing that item's last position; upgrade if quits during
+        // server stalls turn out to matter.
         let stalled = self.pending_resolve.as_ref().is_some_and(|p| p.expired);
         let flush = if stalled {
             Duration::ZERO
@@ -309,7 +310,8 @@ impl Runtime {
             })
             .unwrap_or_default();
         self.feed(ReceiverEvent::PlayerFileLoaded { generation });
-        self.add_subtitles(generation, &sub_adds, selection);
+        self.subtitle_wait = Some(SubtitleWait::new(generation, sub_adds, selection));
+        self.advance_subtitles();
         for name in ["pause", "volume", "mute", "aid"] {
             if let Some(event) = self.player_event(generation, name) {
                 self.feed(event);
@@ -317,28 +319,26 @@ impl Runtime {
         }
     }
 
-    /// Starts the `sub-add`s off the plugin thread (a stalled subtitle must not
-    /// freeze it); the selection runs once the last one has finished.
-    fn add_subtitles(
-        &mut self,
-        generation: Generation,
-        sub_adds: &[Vec<String>],
-        selection: Vec<Vec<String>>,
-    ) {
-        let mut issued = 0;
-        for command in sub_adds {
-            let args: Vec<&str> = command.iter().map(String::as_str).collect();
-            match self.mpv.command_async(generation.get(), &args) {
-                Ok(()) => issued += 1,
-                Err(e) => self.mpv.log(&e),
+    /// Issues the next `sub-add` off the plugin thread (a stalled subtitle must
+    /// not freeze it), or applies the selection once none remain.
+    fn advance_subtitles(&mut self) {
+        while let Some(wait) = self.subtitle_wait.as_mut() {
+            let generation = wait.generation();
+            match wait.step() {
+                SubtitleStep::Add(command) => {
+                    let args: Vec<&str> = command.iter().map(String::as_str).collect();
+                    match self.mpv.command_async(generation.get(), &args) {
+                        Ok(()) => return,
+                        Err(e) => self.mpv.log(&e),
+                    }
+                }
+                SubtitleStep::Select(selection) => {
+                    self.subtitle_wait = None;
+                    for command in selection {
+                        self.run(&command);
+                    }
+                }
             }
-        }
-        if issued == 0 {
-            for command in selection {
-                self.run(&command);
-            }
-        } else {
-            self.subtitle_wait = Some(SubtitleWait::new(generation, issued, selection));
         }
     }
 
@@ -348,18 +348,12 @@ impl Runtime {
                 .log(&format!("sub-add: {}", self.mpv.error_string(error)));
         }
         let current = self.current_generation();
-        let Some(wait) = self
+        if self
             .subtitle_wait
-            .as_mut()
-            .filter(|wait| Some(wait.generation()) == current)
-        else {
-            return;
-        };
-        if let Some(selection) = wait.reply(reply_id) {
-            self.subtitle_wait = None;
-            for command in selection {
-                self.run(&command);
-            }
+            .as_ref()
+            .is_some_and(|wait| wait.accepts(reply_id) && Some(wait.generation()) == current)
+        {
+            self.advance_subtitles();
         }
     }
 

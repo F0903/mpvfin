@@ -207,3 +207,29 @@ server close the WebSocket with a normal close first.
 The WebSocket stayed connected for over 75 s while mpvfin sent
 `{"MessageType":"KeepAlive"}` every 30 s. On shutdown the server logged the
 `Stopped` report before the socket closed.
+
+## Media segments (verified against the test server)
+
+Checked on 2026-11-08 against the 10.11.11 test image. Jellyfin derives
+segments only through a provider plugin; `scripts/test-server.ps1 -Action up`
+sets this up without a reset.
+
+- Install: `POST /Packages/Installed/Chapter%20Segments%20Provider?assemblyGuid=698b6f3314ca49b59d79fc3c0ab941f5&version=4.0.0.0`
+  (admin token), then restart the container. `GET /Plugins` lists it as
+  `Chapter Segments Provider`, `Active`. Note: PowerShell 7 does not unroll a
+  JSON array piped straight from `Invoke-RestMethod`; assign it first.
+- Chapters: the plugin maps chapter names to segment types by its default name
+  patterns. These names matched unchanged: `Intro` (Intro), `Recap` (Recap),
+  `Credits` (Outro), `Preview` (Preview); `Cold Open` and `Part 1` produce
+  nothing. Test chapters (E01: Cold Open 0-5, Intro 5-20, Part 1 20-100,
+  Credits 100-120; E02: Recap 0-10, Part 1 10-90, Credits 90-110, Preview
+  110-120) are remuxed in place with `ffmpeg -map 0 -map_chapters 1 -c copy`;
+  marker file `/media/.chapters-v1`. A segment that runs to the last chapter
+  ends at the file end (`EndTicks` about 120.047 s, not exactly 120).
+- Scan: scheduled task key `TaskExtractMediaSegments` ("Media Segment Scan");
+  `POST /ScheduledTasks/Running/{taskId}` starts it, `GET /ScheduledTasks/{taskId}`
+  reports `State` `Running` or `Idle`.
+- Read: `GET /MediaSegments/{itemId}` returns `{"Items":[{"Id","ItemId","Type",
+  "StartTicks","EndTicks"}],"TotalRecordCount","StartIndex"}`; `Type` is
+  `Intro`, `Outro`, `Recap` or `Preview`; ticks are 100 ns units.
+  `includeSegmentTypes` filters.

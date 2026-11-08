@@ -68,4 +68,59 @@ for ($i = 0; $i -lt 90 -and $count -lt 3; $i++) {
     if ($count -lt 3) { Start-Sleep 2 }
 }
 if ($count -ne 3) { throw "expected 3 episodes, got $count" }
+# Media segments: Chapter Segments Provider plugin plus chapters in E01/E02.
+$guid = "698b6f3314ca49b59d79fc3c0ab941f5"
+$waitServer = {
+    $ok = $false
+    for ($i = 0; $i -lt 90 -and -not $ok; $i++) { try { Invoke-RestMethod "$base/System/Info/Public" | Out-Null; $ok = $true } catch { Start-Sleep 2 } }
+    if (-not $ok) { throw "server did not become ready" }
+}
+$plugins = Invoke-RestMethod "$base/Plugins" -Headers $h
+if (-not ($plugins | Where-Object Id -eq $guid)) {
+    Invoke-RestMethod "$base/Packages/Installed/Chapter%20Segments%20Provider?assemblyGuid=$guid&version=4.0.0.0" -Method Post -Headers $h | Out-Null
+    dc restart jellyfin
+    & $waitServer
+}
+$dir = "/media/shows/Test Show/Season 1"
+docker compose -f $compose exec -T jellyfin test -f /media/.chapters-v1
+if ($LASTEXITCODE) {
+    $chapters = @{
+        1 = @(@("Cold Open", 0, 5), @("Intro", 5, 20), @("Part 1", 20, 100), @("Credits", 100, 120))
+        2 = @(@("Recap", 0, 10), @("Part 1", 10, 90), @("Credits", 90, 110), @("Preview", 110, 120))
+    }
+    foreach ($n in 1, 2) {
+        $meta = ";FFMETADATA1`n" + (($chapters[$n] | ForEach-Object { "[CHAPTER]`nTIMEBASE=1/1000`nSTART=$($_[1] * 1000)`nEND=$($_[2] * 1000)`ntitle=$($_[0])" }) -join "`n") + "`n"
+        $f = "$dir/Test Show - S01E0$n.mkv"
+        $meta | docker compose -f $compose exec -T jellyfin sh -c "cat > /tmp/meta$n.txt"
+        if ($LASTEXITCODE) { throw "writing chapter metadata failed" }
+        dc exec -T jellyfin /usr/lib/jellyfin-ffmpeg/ffmpeg -y -loglevel error -i $f -i /tmp/meta$n.txt -map 0 -map_metadata 0 -map_chapters 1 -c copy "$dir/tmp$n.mkv"
+        dc exec -T jellyfin mv "$dir/tmp$n.mkv" $f
+    }
+    dc exec -T jellyfin touch /media/.chapters-v1
+    Invoke-RestMethod "$base/Library/Refresh" -Method Post -Headers $h | Out-Null
+    Start-Sleep 5
+}
+
+$eps = (Invoke-RestMethod "$base/Items?Recursive=true&IncludeItemTypes=Episode&SortBy=SortName" -Headers $h).Items
+if ($eps.Count -ne 3) { throw "expected 3 episodes after refresh, got $($eps.Count)" }
+function Get-Segments($id) {
+    @((Invoke-RestMethod "$base/MediaSegments/$id" -Headers $h).Items | Sort-Object StartTicks |
+        ForEach-Object { "$($_.Type):$([math]::Round($_.StartTicks / 1e7)):$([math]::Round($_.EndTicks / 1e7))" })
+}
+$want = @{ 0 = @("Intro:5:20", "Outro:100:120"); 1 = @("Recap:0:10", "Outro:90:110", "Preview:110:120"); 2 = @() }
+$tasks = Invoke-RestMethod "$base/ScheduledTasks" -Headers $h
+$task = $tasks | Where-Object Key -eq "TaskExtractMediaSegments"
+$got = @{}
+for ($round = 0; $round -lt 3; $round++) {
+    $bad = $false
+    foreach ($k in 0..2) { $got[$k] = Get-Segments $eps[$k].Id; if (($got[$k] -join ",") -ne ($want[$k] -join ",")) { $bad = $true } }
+    if (-not $bad) { break }
+    Invoke-RestMethod "$base/ScheduledTasks/Running/$($task.Id)" -Method Post -Headers $h | Out-Null
+    for ($i = 0; $i -lt 90; $i++) {
+        Start-Sleep 2
+        if ((Invoke-RestMethod "$base/ScheduledTasks/$($task.Id)" -Headers $h).State -eq "Idle") { break }
+    }
+}
+foreach ($k in 0..2) { if (($got[$k] -join ",") -ne ($want[$k] -join ",")) { throw "segments for $($eps[$k].Name) were [$($got[$k] -join ',')], wanted [$($want[$k] -join ',')]" } }
+
 "Test server ready: $count episodes"

@@ -222,8 +222,12 @@ fn remote_play_pause_seek_stop_report_back() {
     c.wait_mpv("volume", &json!(40.0));
     c.session_where(|s| s["PlayState"]["VolumeLevel"] == 40);
 
+    c.wait_mpv("pause", &json!(true));
     c.server.playstate(&c.session, "Stop", None);
     c.session_where(|s| s.get("NowPlayingItem").is_none());
+    // A remote pause belongs to the item, so it must not outlive it.
+    c.wait_mpv("idle-active", &json!(true));
+    c.wait_mpv("pause", &json!(false));
 }
 
 #[test]
@@ -402,14 +406,14 @@ fn quitting_mid_playback_saves_resume_position() {
     c.server.playstate(&c.session, "Seek", Some(secs(45)));
     c.wait_reported_position(secs(45), secs(48));
 
+    // The seek's report already saved ~45 s, and the next tick is 10 s away:
+    // only the stop report can carry the position reached by now.
+    std::thread::sleep(secs(3));
     c.player.quit();
     let resume = poll_until(T10, || {
-        Some(c.server.resume_position(&e02)).filter(|p| !p.is_zero())
+        Some(c.server.resume_position(&e02)).filter(|p| *p >= secs(47))
     });
-    assert!(
-        resume >= secs(40) && resume <= secs(50),
-        "resume position {resume:?}"
-    );
+    assert!(resume <= secs(50), "resume position {resume:?}");
 }
 
 #[test]

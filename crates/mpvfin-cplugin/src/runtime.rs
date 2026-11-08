@@ -397,7 +397,7 @@ impl Runtime {
                 self.mpv.hook_continue(hook_id);
             }
             ReceiverAction::AbortLoad { hook_id } => self.mpv.hook_continue(hook_id),
-            ReceiverAction::SetPaused { paused, .. } => self.set("pause", yes_no(paused)),
+            ReceiverAction::SetPaused { paused, .. } => self.set("file-local-options/pause", yes_no(paused)),
             ReceiverAction::Seek { position, .. } => {
                 self.run(&["seek", &adapter::format_seconds(position), "absolute"]);
             }

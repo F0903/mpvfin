@@ -50,8 +50,8 @@ username/password fallback, all anti-goals, and the Docker test server.
   backend. The `mpvfin-mpv` crate is deleted (Task 2).
 - The plugin never writes `mpv.conf`/`input.conf` and never sets a global
   option. Everything it sets for a Jellyfin item goes through `loadfile`
-  options or `file-local-options/…`. The only exceptions are `volume`,
-  `mute` and `pause`.
+  options or `file-local-options/…`. The only exceptions are `volume`
+  and `mute`.
 - mpvfin owns exactly three files in mpv's config dir:
   - `scripts/mpvfin.dll` (`.so` on Linux)
   - `script-opts/mpvfin.conf` (user-written)

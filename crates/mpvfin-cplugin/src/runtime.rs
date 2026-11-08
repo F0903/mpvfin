@@ -542,6 +542,11 @@ impl Runtime {
                 self.session
                     .submit(Job::Report(Report::Stopped { snapshot, failed }));
             }
+            // wired in Task 4
+            ReceiverAction::ShowSkipButton { .. }
+            | ReceiverAction::HideSkipButton { .. }
+            | ReceiverAction::SeekToEnd { .. }
+            | ReceiverAction::MarkPlayed { .. } => {}
             ReceiverAction::PlaybackFailed { message, .. } => {
                 self.mpv
                     .show_text(&format!("mpvfin: {message}"), Duration::from_secs(5));

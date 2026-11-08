@@ -258,6 +258,32 @@ pub enum PlaybackState {
     Playing(PlaybackSnapshot),
 }
 
+/// What a media segment is.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SegmentKind {
+    /// Opening credits.
+    Intro,
+    /// Recap of earlier episodes.
+    Recap,
+    /// Closing credits.
+    Outro,
+    /// Preview of the next episode.
+    Preview,
+}
+
+/// A skippable span of the playing item.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Segment {
+    /// What the segment is.
+    pub kind: SegmentKind,
+    /// Where it starts.
+    pub start: Duration,
+    /// Where it ends.
+    pub end: Duration,
+    /// Skipping seeks to the end of the file instead of to `end`.
+    pub to_end_of_file: bool,
+}
+
 /// An input to the receiver reducer.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ReceiverEvent {
@@ -359,6 +385,15 @@ pub enum ReceiverEvent {
         /// Why it ended.
         reason: EndReason,
     },
+    /// Jellyfin returned the item's media segments.
+    SegmentsResolved {
+        /// Generation attached to the request.
+        generation: Generation,
+        /// Segments, sorted by start.
+        segments: Vec<Segment>,
+    },
+    /// The viewer asked to skip the active segment.
+    SkipRequested,
     /// Periodic lifecycle-reporting tick.
     ProgressTick,
     /// Receiver shutdown.
@@ -457,6 +492,30 @@ pub enum ReceiverAction {
         /// Termination reason.
         reason: StopReason,
     },
+    /// Show the skip button for a segment.
+    ShowSkipButton {
+        /// Playback generation.
+        generation: Generation,
+        /// Kind of the segment entered.
+        kind: SegmentKind,
+    },
+    /// Hide the skip button.
+    HideSkipButton {
+        /// Playback generation.
+        generation: Generation,
+    },
+    /// Seek mpv to the end of the file.
+    SeekToEnd {
+        /// Playback generation.
+        generation: Generation,
+    },
+    /// Mark the item played on the server.
+    MarkPlayed {
+        /// Playback generation.
+        generation: Generation,
+        /// Jellyfin item identifier.
+        item_id: String,
+    },
     /// Surface a sanitized playback failure.
     PlaybackFailed {
         /// Failed generation.
@@ -476,6 +535,12 @@ pub struct Receiver {
     /// Selection for the start item of the last `Replace`, consumed by the
     /// first matching `PlayerOpening`.
     pending_selection: Option<(String, StreamSelection)>,
+    /// Segments of the current item, sorted by start.
+    segments: Vec<Segment>,
+    /// Segment whose skip button is showing.
+    active: Option<Segment>,
+    /// Segment the viewer skipped, hidden until the position leaves it.
+    dismissed: Option<Segment>,
 }
 
 impl Default for Receiver {
@@ -492,6 +557,9 @@ impl Receiver {
             next_generation: 1,
             playback: PlaybackState::Idle,
             pending_selection: None,
+            segments: Vec::new(),
+            active: None,
+            dismissed: None,
         }
     }
 
@@ -617,6 +685,7 @@ impl Receiver {
                     if seek_completed {
                         actions.push(ReceiverAction::ReportProgress(snapshot.clone()));
                     }
+                    self.evaluate_segments(&mut actions);
                 }
             }
             ReceiverEvent::PlayerPauseChanged { generation, paused } => {
@@ -747,6 +816,42 @@ impl Receiver {
                     actions.push(ReceiverAction::SetSubtitleStream { generation, index });
                 }
             }
+            ReceiverEvent::SegmentsResolved {
+                generation,
+                segments,
+            } => {
+                if matches!(
+                    self.playback,
+                    PlaybackState::Loading { .. } | PlaybackState::Playing(_)
+                ) && self.current_generation() == Some(generation)
+                {
+                    self.segments = segments;
+                    self.evaluate_segments(&mut actions);
+                }
+            }
+            ReceiverEvent::SkipRequested => {
+                if let PlaybackState::Playing(snapshot) = &self.playback
+                    && let Some(segment) = self.active.take()
+                {
+                    let generation = snapshot.generation;
+                    if segment.kind == SegmentKind::Outro {
+                        actions.push(ReceiverAction::MarkPlayed {
+                            generation,
+                            item_id: snapshot.item_id.clone(),
+                        });
+                    }
+                    actions.push(ReceiverAction::HideSkipButton { generation });
+                    actions.push(if segment.to_end_of_file {
+                        ReceiverAction::SeekToEnd { generation }
+                    } else {
+                        ReceiverAction::Seek {
+                            generation,
+                            position: segment.end,
+                        }
+                    });
+                    self.dismissed = Some(segment);
+                }
+            }
             ReceiverEvent::ProgressTick => {
                 if let PlaybackState::Playing(snapshot) = &self.playback {
                     actions.push(ReceiverAction::ReportProgress(snapshot.clone()));
@@ -817,6 +922,35 @@ impl Receiver {
         }
     }
 
+    /// Shows, swaps or hides the skip button for the current position.
+    fn evaluate_segments(&mut self, actions: &mut Vec<ReceiverAction>) {
+        let PlaybackState::Playing(snapshot) = &self.playback else {
+            return;
+        };
+        let (generation, position) = (snapshot.generation, snapshot.position);
+        let found = self
+            .segments
+            .iter()
+            .find(|s| s.start <= position && position < s.end)
+            .cloned();
+        if self.dismissed.is_some() && self.dismissed != found {
+            self.dismissed = None;
+        }
+        let next = found.filter(|s| self.dismissed.as_ref() != Some(s));
+        if next != self.active {
+            if self.active.is_some() {
+                actions.push(ReceiverAction::HideSkipButton { generation });
+            }
+            if let Some(segment) = &next {
+                actions.push(ReceiverAction::ShowSkipButton {
+                    generation,
+                    kind: segment.kind,
+                });
+            }
+            self.active = next;
+        }
+    }
+
     fn control_pause(&self, paused: bool, actions: &mut Vec<ReceiverAction>) {
         // A no-op must stay one: re-pausing would back up `pause=yes` per file.
         if let PlaybackState::Playing(snapshot) = &self.playback
@@ -832,6 +966,14 @@ impl Receiver {
     /// Goes idle. Resolving continues its hook with an abort; Playing reports
     /// a stop. mpv owns the actual entry, so no `StopPlayer`.
     fn terminate_current(&mut self, reason: StopReason, actions: &mut Vec<ReceiverAction>) {
+        if self.active.is_some()
+            && let Some(generation) = self.current_generation()
+        {
+            actions.push(ReceiverAction::HideSkipButton { generation });
+        }
+        self.segments.clear();
+        self.active = None;
+        self.dismissed = None;
         match mem::take(&mut self.playback) {
             // Loading sent no `ReportStarted`, and a stop without a start
             // resets the item's resume position on the server.
@@ -1363,6 +1505,192 @@ mod tests {
         assert_eq!(t.jellyfin_audio_index(2), Some(2));
         assert_eq!(t.mpv_audio_id(9), None);
         assert_eq!(t.jellyfin_audio_index(0), None);
+    }
+
+    fn seg(kind: SegmentKind, start: u64, end: u64, to_end_of_file: bool) -> Segment {
+        Segment {
+            kind,
+            start: Duration::from_secs(start),
+            end: Duration::from_secs(end),
+            to_end_of_file,
+        }
+    }
+
+    fn segments(r: &mut Receiver, g: Generation, list: Vec<Segment>) -> Vec<ReceiverAction> {
+        r.handle(ReceiverEvent::SegmentsResolved {
+            generation: g,
+            segments: list,
+        })
+    }
+
+    fn at(r: &mut Receiver, g: Generation, secs: u64) -> Vec<ReceiverAction> {
+        r.handle(ReceiverEvent::PlayerPositionChanged {
+            generation: g,
+            position: Duration::from_secs(secs),
+            seek_completed: false,
+        })
+    }
+
+    fn show(g: Generation, kind: SegmentKind) -> ReceiverAction {
+        ReceiverAction::ShowSkipButton {
+            generation: g,
+            kind,
+        }
+    }
+
+    fn hide(g: Generation) -> ReceiverAction {
+        ReceiverAction::HideSkipButton { generation: g }
+    }
+
+    fn playing_with(list: Vec<Segment>) -> (Receiver, Generation) {
+        let mut r = Receiver::new();
+        let g = begin_playing(&mut r, "a", 70);
+        assert!(segments(&mut r, g, list).is_empty());
+        (r, g)
+    }
+
+    #[test]
+    fn segment_button_shows_on_entry_and_hides_on_exit() {
+        let (mut r, g) = playing_with(vec![seg(SegmentKind::Intro, 5, 20, false)]);
+        assert!(at(&mut r, g, 4).is_empty());
+        assert_eq!(at(&mut r, g, 5), vec![show(g, SegmentKind::Intro)]);
+        assert!(at(&mut r, g, 10).is_empty());
+        assert_eq!(at(&mut r, g, 20), vec![hide(g)]);
+    }
+
+    #[test]
+    fn segments_arriving_mid_segment_show_the_button_at_once() {
+        let mut r = Receiver::new();
+        let g = begin_playing(&mut r, "a", 70);
+        at(&mut r, g, 8);
+        assert_eq!(
+            segments(&mut r, g, vec![seg(SegmentKind::Intro, 5, 20, false)]),
+            vec![show(g, SegmentKind::Intro)]
+        );
+    }
+
+    #[test]
+    fn stale_segments_are_ignored() {
+        let mut r = Receiver::new();
+        let g = begin_playing(&mut r, "a", 70);
+        assert!(
+            segments(
+                &mut r,
+                gen_(99),
+                vec![seg(SegmentKind::Intro, 0, 20, false)]
+            )
+            .is_empty()
+        );
+        assert!(at(&mut r, g, 8).is_empty());
+    }
+
+    #[test]
+    fn skip_seeks_to_segment_end_and_hides() {
+        let (mut r, g) = playing_with(vec![seg(SegmentKind::Intro, 5, 20, false)]);
+        at(&mut r, g, 10);
+        assert_eq!(
+            r.handle(ReceiverEvent::SkipRequested),
+            vec![
+                hide(g),
+                ReceiverAction::Seek {
+                    generation: g,
+                    position: Duration::from_secs(20)
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn skipping_credits_marks_played_first() {
+        let (mut r, g) = playing_with(vec![seg(SegmentKind::Outro, 90, 110, false)]);
+        at(&mut r, g, 95);
+        assert_eq!(
+            r.handle(ReceiverEvent::SkipRequested),
+            vec![
+                ReceiverAction::MarkPlayed {
+                    generation: g,
+                    item_id: "a".into()
+                },
+                hide(g),
+                ReceiverAction::Seek {
+                    generation: g,
+                    position: Duration::from_secs(110)
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn skipping_a_segment_at_end_of_file_seeks_to_end() {
+        let (mut r, g) = playing_with(vec![seg(SegmentKind::Preview, 90, 100, true)]);
+        at(&mut r, g, 95);
+        assert_eq!(
+            r.handle(ReceiverEvent::SkipRequested),
+            vec![hide(g), ReceiverAction::SeekToEnd { generation: g }]
+        );
+    }
+
+    #[test]
+    fn dismissed_segment_stays_hidden_while_the_seek_lands() {
+        let (mut r, g) = playing_with(vec![seg(SegmentKind::Intro, 5, 20, false)]);
+        at(&mut r, g, 10);
+        r.handle(ReceiverEvent::SkipRequested);
+        assert!(at(&mut r, g, 12).is_empty());
+    }
+
+    #[test]
+    fn seeking_back_into_a_dismissed_segment_shows_it_again() {
+        let (mut r, g) = playing_with(vec![seg(SegmentKind::Intro, 5, 20, false)]);
+        at(&mut r, g, 10);
+        r.handle(ReceiverEvent::SkipRequested);
+        assert!(at(&mut r, g, 25).is_empty());
+        assert_eq!(at(&mut r, g, 10), vec![show(g, SegmentKind::Intro)]);
+    }
+
+    #[test]
+    fn adjacent_segments_swap_the_button() {
+        let (mut r, g) = playing_with(vec![
+            seg(SegmentKind::Outro, 90, 110, false),
+            seg(SegmentKind::Preview, 110, 120, false),
+        ]);
+        assert_eq!(at(&mut r, g, 109), vec![show(g, SegmentKind::Outro)]);
+        assert_eq!(
+            at(&mut r, g, 111),
+            vec![hide(g), show(g, SegmentKind::Preview)]
+        );
+    }
+
+    #[test]
+    fn skip_outside_a_segment_does_nothing() {
+        let (mut r, g) = playing_with(vec![seg(SegmentKind::Intro, 5, 20, false)]);
+        at(&mut r, g, 30);
+        assert!(r.handle(ReceiverEvent::SkipRequested).is_empty());
+        let mut idle = Receiver::new();
+        assert!(idle.handle(ReceiverEvent::SkipRequested).is_empty());
+    }
+
+    #[test]
+    fn item_end_hides_the_button() {
+        let (mut r, g) = playing_with(vec![seg(SegmentKind::Outro, 90, 110, false)]);
+        at(&mut r, g, 95);
+        let actions = r.handle(ended(g, EndReason::Eof));
+        assert!(matches!(
+            actions.as_slice(),
+            [
+                ReceiverAction::HideSkipButton { .. },
+                ReceiverAction::ReportStopped { .. }
+            ]
+        ));
+        assert!(at(&mut r, g, 96).is_empty());
+    }
+
+    #[test]
+    fn next_item_starts_without_old_segments() {
+        let (mut r, g) = playing_with(vec![seg(SegmentKind::Intro, 5, 20, false)]);
+        at(&mut r, g, 10);
+        r.handle(ended(g, EndReason::Eof));
+        let g2 = begin_playing(&mut r, "b", 80);
+        assert!(at(&mut r, g2, 10).is_empty());
     }
 
     #[test]

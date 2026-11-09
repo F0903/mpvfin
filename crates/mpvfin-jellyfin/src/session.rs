@@ -697,10 +697,16 @@ fn listen(
 ) -> Result<(), String> {
     let mut keepalive = Duration::from_secs(30);
     let mut sent = Instant::now();
+    let mut received = Instant::now();
     loop {
         if stop.load(Ordering::Relaxed) {
             let _ = socket.close(None); // writes and flushes the close frame
             return Ok(());
+        }
+        // The server answers every keep-alive, so silence means a dead socket;
+        // a send can go on succeeding into one for minutes.
+        if received.elapsed() >= keepalive * 2 {
+            return Err("nothing received for two keep-alive intervals".to_owned());
         }
         if sent.elapsed() >= keepalive {
             socket
@@ -708,7 +714,11 @@ fn listen(
                 .map_err(clean)?;
             sent = Instant::now();
         }
-        match socket.read() {
+        let read = socket.read();
+        if read.is_ok() {
+            received = Instant::now();
+        }
+        match read {
             Ok(Message::Text(text)) => match parse_inbound(&text) {
                 Inbound::Receiver(e) => sink(SessionEvent::Receiver(e)),
                 Inbound::DisplayMessage { text, duration } => {
@@ -1463,6 +1473,51 @@ mod tests {
             std::iter::from_fn(|| seen.recv_timeout(Duration::from_secs(1)).ok()).collect();
         assert_eq!(lines_with(&more, "/SyncPlay/"), 0, "{more:?}");
         assert!(!events.try_iter().any(|e| is_lost_contact(&e)));
+
+        session.shutdown(Duration::ZERO);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// A keep-alive interval of 500 ms, so two intervals of silence take 1 s.
+    fn short_keep_alive() -> Option<String> {
+        Some(json!({"MessageType": "ForceKeepAlive", "Data": 1}).to_string())
+    }
+
+    fn is_connection_lost(event: &SessionEvent) -> bool {
+        matches!(event, SessionEvent::Log(l) if l.contains("connection lost"))
+    }
+
+    #[test]
+    fn a_socket_that_goes_silent_is_reconnected() {
+        let (seen_tx, _seen) = mpsc::channel();
+        let (frames, frames_rx) = mpsc::channel();
+        let url = group_server(seen_tx, frames_rx, 0, None);
+        let (session, events, dir) = connected_session(&url);
+
+        frames.send(short_keep_alive()).unwrap();
+        assert!(
+            wait_for(&events, Duration::from_secs(5), is_connection_lost),
+            "the stub never answers a keep-alive, and nothing noticed"
+        );
+
+        session.shutdown(Duration::ZERO);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_socket_with_traffic_is_left_alone() {
+        let (seen_tx, _seen) = mpsc::channel();
+        let (frames, frames_rx) = mpsc::channel();
+        let url = group_server(seen_tx, frames_rx, 0, None);
+        let (session, events, dir) = connected_session(&url);
+
+        frames.send(short_keep_alive()).unwrap();
+        for _ in 0..7 {
+            thread::sleep(Duration::from_millis(300));
+            let answer = json!({"MessageType": "KeepAlive"}).to_string();
+            frames.send(Some(answer)).unwrap();
+        }
+        assert!(!events.try_iter().any(|e| is_connection_lost(&e)));
 
         session.shutdown(Duration::ZERO);
         let _ = fs::remove_dir_all(dir);

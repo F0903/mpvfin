@@ -1,7 +1,6 @@
 //! The Jellyfin base URL.
 
 use crate::identity::Secret;
-
 use crate::identity::pct;
 
 /// Scheme, host and optional path prefix, without a trailing slash.

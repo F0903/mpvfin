@@ -6,8 +6,8 @@ use serde_json::{Value, json};
 
 use crate::client::{Client, HttpError};
 use crate::identity::pct;
-use crate::negotiate::PlayMethod;
-use crate::wire::duration_to_ticks;
+use crate::playback::media::PlayMethod;
+use crate::time::duration_to_ticks;
 
 /// What a playback report says about the current item.
 #[derive(Clone, Debug, Eq, PartialEq)]

@@ -11,8 +11,8 @@ use tungstenite::{Message, WebSocket};
 
 use crate::client::sanitize;
 use crate::identity::Secret;
+use crate::remote::{Inbound, parse_inbound};
 use crate::url::BaseUrl;
-use crate::wire::{Inbound, parse_inbound};
 
 /// An open WebSocket to the server. A read waits at most 250 ms.
 pub struct Socket(WebSocket<MaybeTlsStream<TcpStream>>);

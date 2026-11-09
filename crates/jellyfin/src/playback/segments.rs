@@ -6,7 +6,7 @@ use serde_json::Value;
 
 use crate::client::{Client, HttpError};
 use crate::identity::pct;
-use crate::wire::ticks_to_duration;
+use crate::time::ticks_to_duration;
 
 /// What a media segment is.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

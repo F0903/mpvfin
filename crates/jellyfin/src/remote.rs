@@ -4,7 +4,9 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use crate::syncplay::{GroupUpdate, parse_group_message};
+use crate::syncplay::GroupUpdate;
+use crate::syncplay::parse_group_message;
+use crate::time::ticks_to_duration;
 
 /// Where queued items go relative to the player's queue.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -90,20 +92,6 @@ pub enum Inbound {
     Group(GroupUpdate),
     /// Anything unknown, malformed or unsupported.
     Ignored,
-}
-
-/// Converts 100-nanosecond ticks to a duration; negative ticks give zero.
-#[must_use]
-pub fn ticks_to_duration(ticks: i64) -> Duration {
-    u64::try_from(ticks).map_or(Duration::ZERO, |t| {
-        Duration::from_nanos(t.saturating_mul(100))
-    })
-}
-
-/// Converts a duration to 100-nanosecond ticks, saturating.
-#[must_use]
-pub fn duration_to_ticks(d: Duration) -> i64 {
-    i64::try_from(d.as_nanos() / 100).unwrap_or(i64::MAX)
 }
 
 fn int(v: &Value, key: &str) -> Option<i64> {
@@ -239,7 +227,6 @@ mod tests {
     fn play_json(extra: &str) -> String {
         format!(r#"{{"MessageType":"Play","Data":{{{extra}}}}}"#)
     }
-
     fn req(mode: QueueMode, ids: &[&str], idx: usize, secs: u64, sel: StreamSelection) -> Inbound {
         Inbound::Command(RemoteCommand::Play(QueueRequest {
             item_ids: ids.iter().map(|s| (*s).to_owned()).collect(),
@@ -249,7 +236,6 @@ mod tests {
             selection: sel,
         }))
     }
-
     #[test]
     fn parses_play_now_with_start_index_ticks_and_selection() {
         let m = play_json(
@@ -265,7 +251,6 @@ mod tests {
             req(QueueMode::Replace, &["a", "b", "c"], 1, 30, sel)
         );
     }
-
     #[test]
     fn routes_syncplay_messages_to_group() {
         let m = r#"{"MessageType":"SyncPlayGroupUpdate","Data":{"GroupId":"g","Type":"GroupLeft","Data":"x"}}"#;
@@ -273,7 +258,6 @@ mod tests {
         let m = r#"{"MessageType":"SyncPlayCommand","Data":{"Command":"Nope"}}"#;
         assert_eq!(parse_inbound(m), Inbound::Group(GroupUpdate::Ignored));
     }
-
     #[test]
     fn play_next_and_play_last_map_to_queue_modes() {
         for (cmd, mode) in [("PlayNext", QueueMode::Next), ("PlayLast", QueueMode::Last)] {
@@ -286,7 +270,6 @@ mod tests {
             );
         }
     }
-
     #[test]
     fn unsupported_play_commands_and_empty_items_are_ignored() {
         assert_eq!(
@@ -298,7 +281,6 @@ mod tests {
             Inbound::Ignored
         );
     }
-
     #[test]
     fn parses_playstate_commands() {
         use RemoteCommand as E;
@@ -322,13 +304,11 @@ mod tests {
         let bad = r#"{"MessageType":"Playstate","Data":{"Command":"Rewind"}}"#;
         assert_eq!(parse_inbound(bad), Inbound::Ignored);
     }
-
     fn general(name: &str, args: &str) -> String {
         format!(
             r#"{{"MessageType":"GeneralCommand","Data":{{"Name":"{name}","Arguments":{args}}}}}"#
         )
     }
-
     #[test]
     fn parses_general_commands_with_string_arguments() {
         use RemoteCommand as E;
@@ -364,7 +344,6 @@ mod tests {
             Inbound::Ignored
         );
     }
-
     #[test]
     fn display_message_joins_header_and_text() {
         let with = general(
@@ -387,7 +366,6 @@ mod tests {
             }
         );
     }
-
     #[test]
     fn force_keep_alive_sets_interval() {
         assert_eq!(
@@ -395,7 +373,6 @@ mod tests {
             Inbound::ForceKeepAlive(Duration::from_mins(1))
         );
     }
-
     #[test]
     fn unknown_messages_and_fields_are_tolerated() {
         assert_eq!(
@@ -410,13 +387,5 @@ mod tests {
         for junk in ["not json", "", "null", "[]", r#"{"MessageType":5}"#] {
             assert_eq!(parse_inbound(junk), Inbound::Ignored, "{junk}");
         }
-    }
-
-    #[test]
-    fn ticks_convert_both_ways() {
-        assert_eq!(ticks_to_duration(-5), Duration::ZERO);
-        assert_eq!(ticks_to_duration(300_000_000), Duration::from_secs(30));
-        assert_eq!(duration_to_ticks(Duration::from_secs(30)), 300_000_000);
-        assert_eq!(ticks_to_duration(i64::MAX).as_secs(), 18_446_744_073);
     }
 }

@@ -1,5 +1,4 @@
 //! Client identity and the `Authorization` header value.
-
 use std::fmt;
 use std::fmt::Write as _;
 use std::hash::{BuildHasher, Hasher};

@@ -1,13 +1,12 @@
 //! Blocking Jellyfin REST client and reconnect backoff.
-
 use std::fmt;
 use std::time::Duration;
 
-use crate::identity::{App, Secret};
 use serde_json::Value;
 use ureq::Agent;
 use ureq::tls::{RootCerts, TlsConfig};
 
+use crate::identity::{App, Secret};
 use crate::url::BaseUrl;
 
 /// Why a request failed.

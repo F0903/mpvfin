@@ -52,6 +52,11 @@ in another Jellyfin app under Settings > Quick Connect. The login is saved, and
 the password is never seen or stored. If the login is later revoked, mpvfin
 goes back to Quick Connect.
 
+Quick Connect is the only way to log in. If your server has it turned off,
+mpvfin asks you to turn it on in the Jellyfin dashboard. There is no password
+prompt, because anything typed into mpv is shown on screen and written to its
+log file.
+
 mpv then appears in Jellyfin's cast menu under your computer's name. Only the
 first open mpv window connects; others take over when it closes.
 

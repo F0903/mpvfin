@@ -469,7 +469,7 @@ fn quick_connect(
     if client.get("/QuickConnect/Enabled")? != Value::Bool(true) {
         osd(
             sink,
-            "mpvfin: Quick Connect is disabled on this Jellyfin server",
+            "mpvfin: turn on Quick Connect in the Jellyfin dashboard to sign in",
             5,
         );
         return Ok(None);

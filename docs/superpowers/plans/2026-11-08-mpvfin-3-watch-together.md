@@ -10,7 +10,7 @@
 
 **Spec:** `docs/superpowers/specs/2026-11-08-mpvfin-design.md`, goal 3. The wire contract is the research file `.superpowers/research/syncplay.md`, committed by Task 1 as `docs/jellyfin-syncplay.md`. UI facts are in `.superpowers/research/ui-prompts.md`.
 
-**Not in this plan:** the username/password login fallback. Measured: anything typed into mpv's console is written to `--log-file` at every log level and shown on screen. That decision is waiting on the owner.
+**Not in this plan:** the username/password login fallback. Measured: anything typed into mpv's console is written to `--log-file` at every log level and shown on screen. The owner decided to drop it: a server with Quick Connect off gets an OSD message asking to turn it on.
 
 ## Global Constraints
 

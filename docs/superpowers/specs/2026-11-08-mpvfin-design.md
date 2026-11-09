@@ -119,9 +119,9 @@ In build order. Each step must be usable on its own before the next starts.
   per-script config file, `key=value`).
 - On first run with no saved login, mpvfin starts **Quick Connect** and shows
   the code on the OSD until the user approves it from another Jellyfin
-  client. If the server has Quick Connect disabled, mpvfin asks for username
-  and password through the same prompt mechanism the watch-together list
-  uses.
+  client. If the server has Quick Connect disabled, mpvfin says so on the OSD
+  and asks the user to turn it on. There is no password login: anything typed
+  into an mpv prompt is shown on screen and written to mpv's log file.
 - The resulting token and a persistent device ID are saved in one
   mpvfin-owned file in mpv's config folder, next to `script-opts/mpvfin.conf`.
   **The password is never stored.**
@@ -226,7 +226,8 @@ are the designer's suggestions, not the owner's own requirements:
 - Enter as the default skip hotkey.
 - Button covers recap and preview too, and stays up for the whole segment.
 - Skipping credits marks watched and advances to the next item.
-- Quick Connect first, with username/password as fallback.
+- Quick Connect is the only login method (the owner's decision, after testing
+  showed mpv can't take a password safely).
 - Build order 1 → 2 → 3.
 - Direct play only.
 - **One cast target per computer.** Only the first mpv window that opens

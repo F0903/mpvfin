@@ -56,7 +56,7 @@ In build order. Each step must be usable on its own before the next starts.
   button appears. That is fine.
 - When playback enters an **intro, recap, credits (outro) or preview**
   segment, a button appears in the bottom-right corner, above where uosc's
-  timeline sits: "Skip intro", "Skip recap", "Skip credits", "Skip preview".
+  timeline sits: "Skip Intro", "Skip Recap", "Skip Credits", "Skip Preview".
   The plugin draws it on mpv's OSD, so it does not depend on uosc. It stays
   visible for the whole segment.
 - Clicking it, or pressing the hotkey, seeks to the end of the segment. The

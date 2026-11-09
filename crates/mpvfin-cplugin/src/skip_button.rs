@@ -42,29 +42,50 @@ pub fn button_rect(osd_w: i64, osd_h: i64) -> Rect {
 #[must_use]
 pub const fn label(kind: SegmentKind) -> &'static str {
     match kind {
-        SegmentKind::Intro => "Skip intro",
-        SegmentKind::Recap => "Skip recap",
-        SegmentKind::Outro => "Skip credits",
-        SegmentKind::Preview => "Skip preview",
+        SegmentKind::Intro => "Skip Intro",
+        SegmentKind::Recap => "Skip Recap",
+        SegmentKind::Outro => "Skip Credits",
+        SegmentKind::Preview => "Skip Preview",
     }
+}
+
+/// ASS path of a rounded rectangle filling a `w` by `h` box.
+fn rounded_rect_path(w: i64, h: i64) -> String {
+    let r = h / 8;
+    // Bezier handle length that makes a quarter circle.
+    let c = r * 55 / 100;
+    let (right, bottom) = (w - r, h - r);
+    let (near, far_x, far_y) = (r - c, right + c, bottom + c);
+    format!(
+        "m {r} 0 l {right} 0 b {far_x} 0 {w} {near} {w} {r} l {w} {bottom} b {w} {far_y} {far_x} {h} {right} {h} l {r} {h} b {near} {h} 0 {far_y} 0 {bottom} l 0 {r} b 0 {near} {near} 0 {r} 0"
+    )
+}
+
+/// ASS path of a skip-next symbol, a triangle and a bar, `size` tall.
+fn skip_icon_path(size: i64) -> String {
+    let (tip, left, right) = (size * 5 / 8, size * 3 / 4, size * 3 / 4 + size / 5);
+    let middle = size / 2;
+    format!(
+        "m 0 0 l {tip} {middle} l 0 {size} m {left} 0 l {right} 0 l {right} {size} l {left} {size}"
+    )
 }
 
 /// `osd-overlay` command drawing the button.
 #[must_use]
 pub fn draw_command(kind: SegmentKind, osd_w: i64, osd_h: i64, hovered: bool) -> Vec<String> {
     let Rect { x, y, w, h } = button_rect(osd_w, osd_h);
-    let fill = if hovered { "606060" } else { "202020" };
-    let r = h / 4;
-    let (right, bottom) = (w - r, h - r);
-    let shape = format!(
-        "m {r} 0 l {right} 0 b {w} 0 {w} 0 {w} {r} l {w} {bottom} b {w} {h} {w} {h} {right} {h} \
-         l {r} {h} b 0 {h} 0 {h} 0 {bottom} l 0 {r} b 0 0 0 0 {r} 0"
+    let fill = if hovered { "505050" } else { "303030" };
+    let body = rounded_rect_path(w, h);
+    let (center_x, center_y, font_size, text) = (x + w / 2, y + h / 2, h * 45 / 100, label(kind));
+    let icon = skip_icon_path(font_size * 3 / 4);
+    let drop = font_size / 8;
+    let background =
+        format!(r"{{\an7\pos({x},{y})\bord0\shad0\1c&H{fill}&\1a&H00&\p1}}{body}{{\p0}}");
+    // The icon is drawn inline, so libass centres the label and icon together.
+    let content = format!(
+        r"{{\an5\pos({center_x},{center_y})\bord0\shad0\1c&HE6E6E6&\1a&H00&\b1\fs{font_size}}}{text} {{\p1\pbo{drop}}}{icon}{{\p0}}"
     );
-    let (center_x, center_y, font_size, text) = (x + w / 2, y + h / 2, h / 2, label(kind));
-    let data = format!(
-        "{{\\an7\\pos({x},{y})\\bord0\\shad0\\1c&H{fill}&\\1a&H40&\\p1}}{shape}{{\\p0}}\n\
-         {{\\an5\\pos({center_x},{center_y})\\bord0\\shad0\\1c&HFFFFFF&\\1a&H00&\\fs{font_size}}}{text}"
-    );
+    let data = format!("{background}\n{content}");
     [
         "osd-overlay",
         "1",
@@ -165,10 +186,10 @@ mod tests {
 
     #[test]
     fn labels_match_the_spec() {
-        assert_eq!(label(SegmentKind::Intro), "Skip intro");
-        assert_eq!(label(SegmentKind::Recap), "Skip recap");
-        assert_eq!(label(SegmentKind::Outro), "Skip credits");
-        assert_eq!(label(SegmentKind::Preview), "Skip preview");
+        assert_eq!(label(SegmentKind::Intro), "Skip Intro");
+        assert_eq!(label(SegmentKind::Recap), "Skip Recap");
+        assert_eq!(label(SegmentKind::Outro), "Skip Credits");
+        assert_eq!(label(SegmentKind::Preview), "Skip Preview");
     }
 
     #[test]
@@ -180,8 +201,18 @@ mod tests {
         let lines: Vec<&str> = command[3].split('\n').collect();
         assert_eq!(lines.len(), 2, "one drawing line and one label line");
         assert!(lines[0].contains(r"\p1"), "the fill is a drawing");
-        assert!(lines[1].contains(r"\fs21"), "font size is half the height");
-        assert!(lines[1].ends_with("Skip recap"));
+        assert!(
+            lines[1].contains(r"\b1\fs19"),
+            "bold, a bit under half the height"
+        );
+        let (text, icon) = lines[1]
+            .split_once(r"{\p1")
+            .expect("an icon follows the label");
+        assert!(
+            text.ends_with("Skip Recap "),
+            "label before the icon: {text}"
+        );
+        assert_eq!(icon.matches('m').count(), 2, "a triangle and a bar: {icon}");
     }
 
     #[test]

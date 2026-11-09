@@ -1479,8 +1479,8 @@ mod tests {
     }
 
     /// A keep-alive interval of 500 ms, so two intervals of silence take 1 s.
-    fn short_keep_alive() -> Option<String> {
-        Some(json!({"MessageType": "ForceKeepAlive", "Data": 1}).to_string())
+    fn short_keep_alive() -> String {
+        json!({"MessageType": "ForceKeepAlive", "Data": 1}).to_string()
     }
 
     fn is_connection_lost(event: &SessionEvent) -> bool {
@@ -1494,7 +1494,7 @@ mod tests {
         let url = group_server(seen_tx, frames_rx, 0, None);
         let (session, events, dir) = connected_session(&url);
 
-        frames.send(short_keep_alive()).unwrap();
+        frames.send(Some(short_keep_alive())).unwrap();
         assert!(
             wait_for(&events, Duration::from_secs(5), is_connection_lost),
             "the stub never answers a keep-alive, and nothing noticed"
@@ -1511,7 +1511,7 @@ mod tests {
         let url = group_server(seen_tx, frames_rx, 0, None);
         let (session, events, dir) = connected_session(&url);
 
-        frames.send(short_keep_alive()).unwrap();
+        frames.send(Some(short_keep_alive())).unwrap();
         for _ in 0..7 {
             thread::sleep(Duration::from_millis(300));
             let answer = json!({"MessageType": "KeepAlive"}).to_string();

@@ -1,0 +1,25 @@
+[package]
+name = "mpvfin"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lib]
+name = "mpvfin"
+crate-type = ["cdylib"]
+
+[dependencies]
+jellyfin = { path = "../jellyfin" }
+jpeg-decoder = { version = "0.3", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = { version = "3", features = ["json", "platform-verifier"] }
+
+[dev-dependencies]
+# The session tests stand in for the server's WebSocket.
+tungstenite = "0.30"
+
+[lints]
+workspace = true
+

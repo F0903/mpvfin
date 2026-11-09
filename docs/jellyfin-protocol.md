@@ -160,7 +160,7 @@ verified against that image, all unauthenticated until login:
 ## Local auth proxy
 
 mpv logs every property set at `-v` and command arguments at `debug`, so it
-must never hold the token. `mpvfin-jellyfin` runs a proxy on
+must never hold the token. The plugin runs a proxy on
 `http://127.0.0.1:<port>/<random 32 hex>` and builds every stream and subtitle
 URL on that base; the `Authorization` header is added upstream.
 

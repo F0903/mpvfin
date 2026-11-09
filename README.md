@@ -27,7 +27,7 @@ with C-plugin support. Windows is the tested platform.
 Build the plugin, or use a build you already have:
 
 ```powershell
-cargo build --release -p mpvfin-cplugin
+cargo build --release -p mpvfin
 ```
 
 1. Copy `target/release/mpvfin.dll` into the `scripts/` folder of mpv's config
@@ -148,7 +148,7 @@ behind:
 ```powershell
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
-cargo build -p mpvfin-cplugin
+cargo build -p mpvfin
 ./scripts/smoke-test-cplugin.ps1 -MpvPath .tools/mpv/mpv.com
 ```
 
@@ -160,8 +160,8 @@ These drive a real mpv against a throwaway Jellyfin in Docker. Plain
 
 ```powershell
 ./scripts/test-server.ps1 -Action up
-cargo build -p mpvfin-cplugin
-cargo test -p mpvfin-e2e -- --ignored --test-threads=1
+cargo build -p mpvfin
+cargo test -p e2e -- --ignored --test-threads=1
 ```
 
 Set `MPVFIN_E2E_MPV` or `MPVFIN_E2E_SERVER` to use another mpv or server.

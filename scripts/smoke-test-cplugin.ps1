@@ -13,7 +13,7 @@ $pluginPath = Join-Path $repoRoot "target\$Configuration\mpvfin.dll"
 $resolvedMpv = (Resolve-Path -LiteralPath $MpvPath).Path
 
 if (-not (Test-Path -LiteralPath $pluginPath -PathType Leaf)) {
-    throw "Plugin not found at '$pluginPath'. Build it with: cargo build -p mpvfin-cplugin"
+    throw "Plugin not found at '$pluginPath'. Build it with: cargo build -p mpvfin"
 }
 
 # mpv shows the single 1 fps frame as an image, for 5 s by default; with

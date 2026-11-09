@@ -194,6 +194,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "e2e"
+version = "0.1.0"
+dependencies = [
+ "jellyfin",
+ "serde",
+ "serde_json",
+ "tungstenite",
+ "ureq",
+]
+
+[[package]]
 name = "equivalent"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -400,6 +411,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
+name = "jellyfin"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "tungstenite",
+ "ureq",
+]
+
+[[package]]
 name = "jni"
 version = "0.22.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -495,35 +515,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "mpvfin-core"
-version = "0.1.0"
-
-[[package]]
-name = "mpvfin-cplugin"
+name = "mpvfin"
 version = "0.1.0"
 dependencies = [
- "mpvfin-core",
- "mpvfin-jellyfin",
- "serde_json",
-]
-
-[[package]]
-name = "mpvfin-e2e"
-version = "0.1.0"
-dependencies = [
- "mpvfin-core",
- "mpvfin-jellyfin",
- "serde_json",
- "tungstenite",
- "ureq",
-]
-
-[[package]]
-name = "mpvfin-jellyfin"
-version = "0.1.0"
-dependencies = [
+ "jellyfin",
  "jpeg-decoder",
- "mpvfin-core",
  "serde",
  "serde_json",
  "tungstenite",

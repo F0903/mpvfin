@@ -19,16 +19,15 @@ plugin talks to mpv.
              plugin thread --- mpv client API ---> mpv
                    |
                    v
-             mpvfin-core (reducer: the only owner of playback state)
+             receiver (reducer: the only owner of playback state)
 ```
 
-- `mpvfin-core`: a synchronous reducer. It takes a typed event, updates its
+- `receiver`: a synchronous reducer. It takes a typed event, updates its
   state and returns actions. It performs no I/O and owns no threads.
-- `mpvfin-jellyfin`: config, the state file, login, WebSocket supervision,
-  playback negotiation, reports and the local auth proxy. It runs entirely on
-  its own threads and never touches mpv.
-- `mpvfin-cplugin`: the plugin entry point, the mpv client-API wrapper, and
-  the event loop that connects the other two.
+- `server`: config, the state file, login, WebSocket supervision and the local
+  auth proxy. It runs entirely on its own threads and never touches mpv.
+- `runtime`: the event loop that connects the other two. Its `mpv` module, the
+  client-API wrapper, is private, so nothing else in the plugin can reach mpv.
 
 ## Threads and the waker
 
@@ -205,7 +204,15 @@ every five seconds, so they take over when the first closes.
 
 ## Workspace
 
-- `mpvfin-core`: state, events, actions and lifecycle rules.
-- `mpvfin-jellyfin`: Jellyfin transport, login, state file and media proxy.
-- `mpvfin-cplugin`: native mpv plugin (`mpvfin.dll`) and client-API adapter.
-- `mpvfin-e2e`: end-to-end tests against a Docker Jellyfin and a real mpv.
+- `jellyfin`: a Jellyfin client: a typed method per request, the WebSocket, and
+  the protocol's types. It knows nothing about mpv or the player, takes the
+  app's name from its caller, and depends on no other crate here.
+- `mpvfin`: the native mpv plugin (`mpvfin.dll`), organised by domain:
+  - `receiver`: state, events, actions and lifecycle rules.
+  - `runtime`: the event loop, and the only code that can reach mpv.
+  - `server`: the connection to Jellyfin, the state file and the media proxy.
+  - `skip_button`, `next_up`, `watch_together`: what each feature draws and
+    asks of mpv.
+- `e2e`: end-to-end tests against a Docker Jellyfin and a real mpv. It writes
+  `mpvfin-state.json` from its own copy of the format, so a change that would
+  break existing users' files fails a test.

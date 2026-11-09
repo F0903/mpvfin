@@ -38,6 +38,10 @@ use crate::wire::{Inbound, parse_inbound};
 const CLOCK_SAMPLES: usize = 5;
 /// Time between clock batches while in a group.
 const CLOCK_PERIOD: Duration = Duration::from_mins(1);
+/// Attempts in all for a request the group's wait depends on.
+const GROUP_WAIT_ATTEMPTS: u32 = 3;
+/// Between those attempts, so one network hiccup can't take all three.
+const GROUP_RETRY_PAUSE: Duration = Duration::from_millis(500);
 
 /// Where the plugin's files live.
 #[derive(Debug)]
@@ -725,35 +729,73 @@ fn listen(
     }
 }
 
+fn post_group_request(
+    request: &GroupRequest,
+    current: Option<&Creds>,
+    group: &Mutex<GroupState>,
+) -> Result<(), String> {
+    let c = current.ok_or_else(|| "not connected".to_owned())?;
+    // Stamped here, not at submit: this queue can be behind.
+    let server_now_ms = local_now_ms() + locked(group).offset_ms;
+    let (path, body) = request_path_and_body(request, server_now_ms);
+    c.client.post(path, &body).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 fn send_group_request(
     request: &GroupRequest,
-    current: Option<Creds>,
+    current: Option<&Creds>,
     sink: &Sink,
+    stop: &AtomicBool,
     group: &Mutex<GroupState>,
 ) {
     if *request == GroupRequest::Leave {
         locked(group).joined = None; // even if the POST fails: never rejoin
     }
-    let result = current
-        .ok_or_else(|| "not connected".to_owned())
-        .and_then(|c| {
-            // Stamped here, not at submit: this queue can be behind.
-            let server_now_ms = local_now_ms() + locked(group).offset_ms;
-            let (path, body) = request_path_and_body(request, server_now_ms);
-            c.client.post(path, &body).map_err(|e| e.to_string())
-        });
-    if let Err(e) = result {
-        log(sink, format!("group request failed: {e}"));
-        if matches!(
-            request,
-            GroupRequest::New { .. } | GroupRequest::Join { .. }
-        ) {
-            osd(
-                sink,
-                "mpvfin: couldn't reach Jellyfin to join that group",
-                5,
-            );
+    // The server has no timeout: if one of these is lost, the group waits forever.
+    let group_waits = matches!(
+        request,
+        GroupRequest::Ready { .. } | GroupRequest::Buffering { .. }
+    );
+    let mut result = post_group_request(request, current, group);
+    for _ in 1..if group_waits { GROUP_WAIT_ATTEMPTS } else { 1 } {
+        if result.is_ok() || !sleep(stop, GROUP_RETRY_PAUSE) {
+            break;
         }
+        result = post_group_request(request, current, group);
+    }
+    let Err(e) = result else {
+        return;
+    };
+    log(sink, format!("group request failed: {e}"));
+    if matches!(
+        request,
+        GroupRequest::New { .. } | GroupRequest::Join { .. }
+    ) {
+        osd(
+            sink,
+            "mpvfin: couldn't reach Jellyfin to join that group",
+            5,
+        );
+    }
+    if group_waits && !stop.load(Ordering::Relaxed) {
+        give_up_on_group(current, sink, group);
+    }
+}
+
+/// Out of the group, so it can go on without us; the viewer hears first, as
+/// the Leave can stall as long as the requests that just failed.
+fn give_up_on_group(current: Option<&Creds>, sink: &Sink, group: &Mutex<GroupState>) {
+    {
+        let mut state = locked(group);
+        state.joined = None;
+        state.in_group = false;
+    }
+    sink(SessionEvent::Receiver(ReceiverEvent::GroupGone {
+        message: "mpvfin: lost contact with the group, so you've left it".to_owned(),
+    }));
+    if let Err(e) = post_group_request(&GroupRequest::Leave, current, group) {
+        log(sink, format!("leaving the group failed: {e}"));
     }
 }
 
@@ -785,7 +827,9 @@ fn work(
         }
         let current = locked(creds).clone();
         match job {
-            Job::Group(request) => send_group_request(&request, current, sink, group),
+            Job::Group(request) => {
+                send_group_request(&request, current.as_ref(), sink, stop, group);
+            }
             Job::ListGroups => list_groups(current, sink),
             Job::Resolve {
                 generation,
@@ -886,6 +930,7 @@ mod tests {
     use crate::syncplay::format_utc;
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpListener;
+    use std::sync::atomic::AtomicUsize;
 
     /// Answers everything except `/MediaSegments`, which it never answers and
     /// reports on `segments_asked`. Returns its URL.
@@ -964,12 +1009,24 @@ mod tests {
         offset_ms: i64,
         failing: Option<&'static str>,
     ) -> String {
+        flaky_group_server(seen, frames, offset_ms, failing, usize::MAX)
+    }
+
+    /// As `group_server`, with only the first `failures` matching requests failing.
+    fn flaky_group_server(
+        seen: Sender<(String, String)>,
+        frames: Receiver<Option<String>>,
+        offset_ms: i64,
+        failing: Option<&'static str>,
+        failures: usize,
+    ) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let frames = Arc::new(Mutex::new(frames));
+        let failures = Arc::new(AtomicUsize::new(failures));
         thread::spawn(move || {
             for stream in listener.incoming().flatten() {
-                let (seen, frames) = (seen.clone(), frames.clone());
+                let (seen, frames, failures) = (seen.clone(), frames.clone(), failures.clone());
                 thread::spawn(move || {
                     if is_websocket(&stream) {
                         let mut socket = tungstenite::accept(stream).unwrap();
@@ -983,7 +1040,11 @@ mod tests {
                         return;
                     }
                     let (request, body) = read_request(&stream);
-                    let status = if failing.is_some_and(|path| request.contains(path)) {
+                    let fails = failing.is_some_and(|path| request.contains(path))
+                        && failures
+                            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                            .is_ok();
+                    let status = if fails {
                         "500 Internal Server Error"
                     } else {
                         "200 OK"
@@ -1292,6 +1353,116 @@ mod tests {
             );
             matches!(e, SessionEvent::Log(l) if l.contains("group request failed"))
         }));
+
+        session.shutdown(Duration::ZERO);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    fn ready_request() -> GroupRequest {
+        GroupRequest::Ready {
+            position: Duration::ZERO,
+            is_playing: false,
+            pid: "p".to_owned(),
+        }
+    }
+
+    fn is_lost_contact(event: &SessionEvent) -> bool {
+        matches!(
+            event,
+            SessionEvent::Receiver(ReceiverEvent::GroupGone { message })
+                if message == "mpvfin: lost contact with the group, so you've left it"
+        )
+    }
+
+    fn lines_with(requests: &[(String, String)], path: &str) -> usize {
+        requests
+            .iter()
+            .filter(|(line, _)| line.contains(path))
+            .count()
+    }
+
+    #[test]
+    fn a_ready_that_fails_twice_is_sent_again_with_a_fresh_when() {
+        let (seen_tx, seen) = mpsc::channel();
+        let (_frames, frames_rx) = mpsc::channel();
+        let url = flaky_group_server(seen_tx, frames_rx, 0, Some("/SyncPlay/Ready"), 2);
+        let (session, events, dir) = connected_session(&url);
+
+        session.submit(Job::Group(ready_request()));
+        let stamps: Vec<i64> = (0..3)
+            .map(|_| {
+                let (_, body) = requests_until(&seen, "/SyncPlay/Ready").pop().unwrap();
+                let body: Value = serde_json::from_str(&body).unwrap();
+                parse_utc_ms(body["When"].as_str().unwrap()).unwrap()
+            })
+            .collect();
+        assert!(stamps.is_sorted_by(|a, b| a < b), "stale When: {stamps:?}");
+
+        let more: Vec<_> =
+            std::iter::from_fn(|| seen.recv_timeout(Duration::from_secs(1)).ok()).collect();
+        assert_eq!(
+            lines_with(&more, "/SyncPlay/Ready"),
+            0,
+            "the third one worked"
+        );
+        assert_eq!(lines_with(&more, "/SyncPlay/Leave"), 0);
+        assert!(!events.try_iter().any(|e| is_lost_contact(&e)));
+
+        session.shutdown(Duration::ZERO);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_ready_or_buffering_that_keeps_failing_leaves_the_group() {
+        let buffering = GroupRequest::Buffering {
+            position: Duration::ZERO,
+            pid: "p".to_owned(),
+        };
+        for (request, path) in [
+            (ready_request(), "/SyncPlay/Ready"),
+            (buffering, "/SyncPlay/Buffering"),
+        ] {
+            let (seen_tx, seen) = mpsc::channel();
+            let (frames, frames_rx) = mpsc::channel();
+            let url = group_server(seen_tx, frames_rx, 0, Some(path));
+            let (session, events, dir) = connected_session(&url);
+            let soon = Duration::from_secs(5);
+            frames.send(Some(group_frame("GroupJoined", "g1"))).unwrap();
+            assert!(wait_for(&events, soon, |e| has_joined(e, "g1")));
+
+            session.submit(Job::Group(request));
+            let requests = requests_until(&seen, "/SyncPlay/Leave");
+            assert_eq!(lines_with(&requests, path), 3, "three attempts in all");
+            assert!(wait_for(&events, soon, is_lost_contact), "{path}");
+
+            // The group is given up, so a reconnect must not rejoin it.
+            frames.send(None).unwrap();
+            let connected =
+                |e: &SessionEvent| matches!(e, SessionEvent::Log(l) if l.contains("connected"));
+            assert!(wait_for(&events, soon, connected));
+            frames.send(Some(group_frame("GroupJoined", "g2"))).unwrap();
+            assert!(wait_for(&events, soon, |e| has_joined(e, "g2")));
+            let later: Vec<_> = seen.try_iter().collect();
+            assert_eq!(lines_with(&later, "/SyncPlay/Join"), 0);
+
+            session.shutdown(Duration::ZERO);
+            let _ = fs::remove_dir_all(dir);
+        }
+    }
+
+    #[test]
+    fn other_failed_requests_are_sent_once_and_keep_the_group() {
+        let (seen_tx, seen) = mpsc::channel();
+        let (_frames, frames_rx) = mpsc::channel();
+        let url = group_server(seen_tx, frames_rx, 0, Some("/SyncPlay/Unpause"));
+        let (session, events, dir) = connected_session(&url);
+
+        session.submit(Job::Group(GroupRequest::Unpause));
+        requests_until(&seen, "/SyncPlay/Unpause");
+        let more: Vec<_> =
+            std::iter::from_fn(|| seen.recv_timeout(Duration::from_secs(1)).ok()).collect();
+        assert_eq!(lines_with(&more, "/SyncPlay/"), 0, "{more:?}");
+        assert!(!events.try_iter().any(|e| is_lost_contact(&e)));
 
         session.shutdown(Duration::ZERO);
         let _ = fs::remove_dir_all(dir);

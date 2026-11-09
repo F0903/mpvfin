@@ -131,6 +131,16 @@ impl Client {
         json_reply(request.header("Authorization", self.auth.expose()).call())
     }
 
+    /// `GET`s `path_and_query` and returns the raw reply, up to `limit` bytes.
+    ///
+    /// # Errors
+    /// Non-success status, transport failure, or a longer reply.
+    pub fn get_bytes(&self, path_and_query: &str, limit: u64) -> Result<Vec<u8>, HttpError> {
+        let request = self.agent.get(self.base.join(path_and_query));
+        let mut reply = request.header("Authorization", self.auth.expose()).call()?;
+        Ok(reply.body_mut().with_config().limit(limit).read_to_vec()?)
+    }
+
     /// `POST`s `body` as JSON (no body when `Null`) and parses the JSON reply.
     ///
     /// # Errors

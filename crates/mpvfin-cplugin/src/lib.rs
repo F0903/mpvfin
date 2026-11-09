@@ -8,6 +8,7 @@ mod drift;
 pub mod ffi;
 pub mod group_menu;
 pub mod mpv;
+pub mod next_up;
 pub mod runtime;
 pub mod skip_button;
 

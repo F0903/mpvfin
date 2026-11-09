@@ -2,10 +2,14 @@
 
 use mpvfin_core::SegmentKind;
 
+use crate::next_up;
+
 /// Input section holding the button's keyboard shortcut, enabled while it is up.
 pub const KEY_SECTION: &str = "mpvfin-skip-key";
 /// Input section holding the button's click, enabled while the pointer is over it.
 pub const CLICK_SECTION: &str = "mpvfin-skip-click";
+
+const OVERLAY_ID: &str = "1";
 
 /// A rectangle in OSD pixels.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -49,9 +53,8 @@ pub const fn label(kind: SegmentKind) -> &'static str {
     }
 }
 
-/// ASS path of a rounded rectangle filling a `w` by `h` box.
-fn rounded_rect_path(w: i64, h: i64) -> String {
-    let r = h / 8;
+/// ASS path of a rectangle filling a `w` by `h` box, with corners of radius `r`.
+pub(crate) fn rounded_rect_path(w: i64, h: i64, r: i64) -> String {
     // Bezier handle length that makes a quarter circle.
     let c = r * 55 / 100;
     let (right, bottom) = (w - r, h - r);
@@ -70,13 +73,12 @@ fn skip_icon_path(size: i64) -> String {
     )
 }
 
-/// `osd-overlay` command drawing the button.
-#[must_use]
-pub fn draw_command(kind: SegmentKind, osd_w: i64, osd_h: i64, hovered: bool) -> Vec<String> {
-    let Rect { x, y, w, h } = button_rect(osd_w, osd_h);
+/// ASS events of a button with `text` and a skip icon.
+pub(crate) fn button_events(rect: Rect, text: &str, hovered: bool) -> String {
+    let Rect { x, y, w, h } = rect;
     let fill = if hovered { "505050" } else { "303030" };
-    let body = rounded_rect_path(w, h);
-    let (center_x, center_y, font_size, text) = (x + w / 2, y + h / 2, h * 45 / 100, label(kind));
+    let body = rounded_rect_path(w, h, h / 8);
+    let (center_x, center_y, font_size) = (x + w / 2, y + h / 2, h * 45 / 100);
     let icon = skip_icon_path(font_size * 3 / 4);
     let drop = font_size / 8;
     let background =
@@ -85,12 +87,16 @@ pub fn draw_command(kind: SegmentKind, osd_w: i64, osd_h: i64, hovered: bool) ->
     let content = format!(
         r"{{\an5\pos({center_x},{center_y})\bord0\shad0\1c&HE6E6E6&\1a&H00&\b1\fs{font_size}}}{text} {{\p1\pbo{drop}}}{icon}{{\p0}}"
     );
-    let data = format!("{background}\n{content}");
+    format!("{background}\n{content}")
+}
+
+/// `osd-overlay` command showing `data` on overlay `id`.
+pub(crate) fn overlay_command(id: &str, data: &str, osd_w: i64, osd_h: i64) -> Vec<String> {
     [
         "osd-overlay",
-        "1",
+        id,
         "ass-events",
-        &data,
+        data,
         &osd_w.to_string(),
         &osd_h.to_string(),
         "0",
@@ -101,20 +107,43 @@ pub fn draw_command(kind: SegmentKind, osd_w: i64, osd_h: i64, hovered: bool) ->
     .into()
 }
 
-/// `osd-overlay` command removing the button.
-#[must_use]
-pub fn clear_command() -> Vec<String> {
-    ["osd-overlay", "1", "none", "", "0", "720", "0", "no", "no"]
+/// `osd-overlay` command removing overlay `id`.
+pub(crate) fn clear_overlay_command(id: &str) -> Vec<String> {
+    ["osd-overlay", id, "none", "", "0", "720", "0", "no", "no"]
         .map(str::to_owned)
         .into()
 }
 
+/// `osd-overlay` command drawing the button.
+#[must_use]
+pub fn draw_command(kind: SegmentKind, osd_w: i64, osd_h: i64, hovered: bool) -> Vec<String> {
+    let data = button_events(button_rect(osd_w, osd_h), label(kind), hovered);
+    overlay_command(OVERLAY_ID, &data, osd_w, osd_h)
+}
+
+/// `osd-overlay` command removing the button.
+#[must_use]
+pub fn clear_command() -> Vec<String> {
+    clear_overlay_command(OVERLAY_ID)
+}
+
 /// Commands defining the button's input sections, inert until enabled.
+#[must_use]
+pub fn define_section_commands(client: &str) -> Vec<Vec<String>> {
+    input_section_commands(KEY_SECTION, CLICK_SECTION, "ENTER", client, "skip")
+}
+
+/// Commands defining a button's key and click sections, both running `binding`.
 ///
 /// `default` lets a user's own binding of the key win; `force` makes the click
 /// win over anything else, and is only enabled while the pointer is on the button.
-#[must_use]
-pub fn define_section_commands(client: &str) -> Vec<Vec<String>> {
+pub(crate) fn input_section_commands(
+    key_section: &str,
+    click_section: &str,
+    key: &str,
+    client: &str,
+    binding: &str,
+) -> Vec<Vec<String>> {
     let section = |name: &str, bindings: String, flag: &str| {
         vec![
             "define-section".to_owned(),
@@ -123,13 +152,13 @@ pub fn define_section_commands(client: &str) -> Vec<Vec<String>> {
             flag.to_owned(),
         ]
     };
-    let skip = format!("script-binding {client}/skip");
+    let run = format!("script-binding {client}/{binding}");
     vec![
-        section(KEY_SECTION, format!("ENTER {skip}\n"), "default"),
+        section(key_section, format!("{key} {run}\n"), "default"),
         // Ignored here, or a double click would also reach mpv's fullscreen binding.
         section(
-            CLICK_SECTION,
-            format!("MBTN_LEFT {skip}\nMBTN_LEFT_DBL ignore\n"),
+            click_section,
+            format!("MBTN_LEFT {run}\nMBTN_LEFT_DBL ignore\n"),
             "force",
         ),
     ]
@@ -146,7 +175,7 @@ pub fn set_section_command(section: &str, enabled: bool) -> Vec<String> {
     let mut command = vec![name.to_owned(), section.to_owned()];
     // Its mouse area is the whole window; without these flags the cursor could
     // not hide and the window could not be dragged during a segment.
-    if enabled && section == KEY_SECTION {
+    if enabled && [KEY_SECTION, next_up::KEY_SECTION].contains(&section) {
         command.push("allow-hide-cursor+allow-vo-dragging".to_owned());
     }
     command

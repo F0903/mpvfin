@@ -2446,6 +2446,22 @@ mod tests {
     }
 
     #[test]
+    fn play_now_in_group_moves_the_group_without_touching_pause() {
+        let (mut r, g) = in_outro(&["p1", "p2"], false);
+        assert_eq!(
+            r.handle(ReceiverEvent::NextUpRequested),
+            vec![
+                ReceiverAction::MarkPlayed {
+                    generation: g,
+                    item_id: "item-p1".into()
+                },
+                ReceiverAction::HideNextUp { generation: g },
+                req(GroupRequest::NextItem { pid: pid("p1") }),
+            ]
+        );
+    }
+
+    #[test]
     fn a_pause_on_its_way_during_buffering_gets_no_anchor() {
         let (mut r, g) = playing(&["p1"], 10);
         r.handle(buffering(g, true));

@@ -81,6 +81,22 @@ off too; `script-binding mpvfin/skip` still works.
 Your Jellyfin server needs a media segment provider plugin; without one it has
 no segments and the button never appears.
 
+## Next Up
+
+When the credits start, or for the last 30 seconds of an item without a credits
+segment, a card above the skip button shows the next item in the playlist, with
+its picture if it has one. Click
+**Play Now** or press **n** to go to it now, which also marks the current item
+as played. In a watch-together group this moves the whole group.
+
+The card only appears when the next entry is a Jellyfin item. As with Enter, `n`
+is only mpvfin's while the card is up, and your own binding of it in `input.conf`
+always wins. To use a key of your choice:
+
+```text
+F7 script-binding mpvfin/next-up
+```
+
 ## Watch together
 
 Join or start a Jellyfin watch-together group from mpv. mpvfin claims no key

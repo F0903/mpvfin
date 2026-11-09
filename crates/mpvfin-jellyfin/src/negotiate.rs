@@ -70,6 +70,19 @@ pub fn display_title(item: &Value) -> String {
     }
 }
 
+/// The title without the series, for where space is tight.
+#[must_use]
+pub fn short_title(item: &Value) -> String {
+    let s = |k: &str| item.get(k).and_then(Value::as_str);
+    let n = |k: &str| item.get(k).and_then(Value::as_i64);
+    match (s("SeriesName"), n("ParentIndexNumber"), n("IndexNumber")) {
+        (Some(_), Some(season), Some(ep)) => {
+            format!("S{season:02}E{ep:02} · {}", s("Name").unwrap_or_default())
+        }
+        _ => display_title(item),
+    }
+}
+
 /// Drops every `ApiKey`/`api_key` query parameter (case-insensitive).
 fn strip_api_key(url: &str) -> String {
     let Some((path, query)) = url.split_once('?') else {
@@ -320,5 +333,16 @@ mod tests {
             "X (2020)"
         );
         assert_eq!(display_title(&json!({"Name": "Name"})), "Name");
+    }
+
+    #[test]
+    fn short_title_drops_the_series_from_episodes() {
+        let ep = json!({"Name": "Pilot", "SeriesName": "Test Show", "ParentIndexNumber": 1, "IndexNumber": 2});
+        assert_eq!(short_title(&ep), "S01E02 · Pilot");
+        assert_eq!(
+            short_title(&json!({"Name": "X", "ProductionYear": 2020})),
+            "X (2020)"
+        );
+        assert_eq!(short_title(&json!({})), "");
     }
 }

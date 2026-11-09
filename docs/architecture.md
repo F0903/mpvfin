@@ -109,6 +109,31 @@ seeks to the segment's end. A segment that runs to the end of the file (within
 reaches EOF and advances the playlist itself. Skipping credits also submits a
 `MarkPlayed` job, which runs on the `jobs` thread.
 
+## Next Up card
+
+The reducer decides when the card is due: from the first `Outro` segment's start,
+or the last 30 s of mpv's `duration` when there is none, until the item ends.
+It emits `ShowNextUp` and `HideNextUp`, and knows nothing about what comes next.
+
+The runtime answers `ShowNextUp` by reading mpv's playlist, so it needs no copy
+of the queue and a group's mirrored playlist works the same way. If the next
+entry is an `mpvfin://` one it submits `Job::NextUpCard`, and draws the card when
+the title and picture come back, so the card never changes size after it appears;
+with no such entry it draws nothing. The playlist is reread on each 10 s tick, so
+an entry queued during the credits appears within that time.
+
+The card is `osd-overlay` 2 with its own `mpvfin-next-up-key` (`n`, `default`) and
+`mpvfin-next-up-click` (`force`) sections, following the skip button's input
+rules. Its width follows its content, and text and picture sit side by side.
+
+mpv can only overlay raw pixels, so the session asks Jellyfin for a JPEG of at most
+640x360 and decodes it to BGRA. `overlay-add` 57 receives the pixels' address and
+scales them to the picture's place; the runtime keeps them until `overlay-remove`,
+and re-adds them when the window resizes. An item with no picture gets a narrower
+card. Play Now becomes `NextUpRequested`: the reducer marks the item played and
+feeds itself `RemoteNext`, which is `playlist-next` alone and `NextItem` in a
+group. Alone it also unpauses first, or mpv would open the next item paused.
+
 ## Watch together
 
 A group is one more source of commands for the same reducer. The server is the

@@ -18,6 +18,9 @@ mod group;
 /// The entry id the server sends when a group has no current item.
 pub const ZERO_ID: &str = "00000000000000000000000000000000";
 
+/// How long before the end the Next Up card shows on an item without credits.
+const NEXT_UP_LEAD: Duration = Duration::from_secs(30);
+
 /// Identifies one playback attempt.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct Generation(u64);
@@ -431,6 +434,15 @@ pub enum ReceiverEvent {
     },
     /// The viewer asked to skip the active segment.
     SkipRequested,
+    /// mpv learned or lost the length of the entry.
+    PlayerDurationChanged {
+        /// Playback generation.
+        generation: Generation,
+        /// Length of the entry, if known.
+        duration: Option<Duration>,
+    },
+    /// The viewer pressed Play Now on the Next Up card.
+    NextUpRequested,
     /// The viewer asked to create a `SyncPlay` group.
     GroupCreate {
         /// Group name.
@@ -576,6 +588,16 @@ pub enum ReceiverAction {
         /// Playback generation.
         generation: Generation,
     },
+    /// The Next Up card is due, if the playlist has a next entry.
+    ShowNextUp {
+        /// Playback generation.
+        generation: Generation,
+    },
+    /// Hide the Next Up card.
+    HideNextUp {
+        /// Playback generation.
+        generation: Generation,
+    },
     /// Seek mpv to the end of the file.
     SeekToEnd {
         /// Playback generation.
@@ -648,6 +670,17 @@ pub struct GroupLoadOptions {
     pub start: Duration,
 }
 
+/// Where the Next Up card stands for the current item.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NextUpState {
+    /// Playback is outside the card's window.
+    Hidden,
+    /// The card is due.
+    Shown,
+    /// Play Now was pressed; no card until playback leaves the window.
+    Taken,
+}
+
 /// Deterministic owner of the receiver playback state.
 #[derive(Debug)]
 pub struct Receiver {
@@ -662,6 +695,9 @@ pub struct Receiver {
     active: Option<Segment>,
     /// Segment the viewer skipped, hidden until the position leaves it.
     dismissed: Option<Segment>,
+    /// Length of the current item, once mpv knows it.
+    duration: Option<Duration>,
+    next_up: NextUpState,
     /// Whether mpv confirmed a position for this item. Before that the position
     /// is the snapshot's zero, from before a requested start.
     position_settled: bool,
@@ -690,6 +726,8 @@ impl Receiver {
             segments: Vec::new(),
             active: None,
             dismissed: None,
+            duration: None,
+            next_up: NextUpState::Hidden,
             position_settled: false,
             group: None,
             creating_group: false,
@@ -1006,6 +1044,33 @@ impl Receiver {
                     self.dismissed = Some(segment);
                 }
             }
+            ReceiverEvent::PlayerDurationChanged {
+                generation,
+                duration,
+            } => {
+                if self.playing_mut(generation).is_some() {
+                    self.duration = duration;
+                    self.evaluate_segments(&mut actions);
+                }
+            }
+            ReceiverEvent::NextUpRequested => {
+                if self.next_up == NextUpState::Shown
+                    && let PlaybackState::Playing(snapshot) = &self.playback
+                {
+                    let generation = snapshot.generation;
+                    actions.push(ReceiverAction::MarkPlayed {
+                        generation,
+                        item_id: snapshot.item_id.clone(),
+                    });
+                    actions.push(ReceiverAction::HideNextUp { generation });
+                    self.next_up = NextUpState::Taken;
+                    // mpv would open the next entry paused; a group's pause is the group's.
+                    if self.group.is_none() {
+                        self.control_pause(false, &mut actions);
+                    }
+                    actions.extend(self.handle(ReceiverEvent::RemoteNext));
+                }
+            }
             ReceiverEvent::PlayerReachedEnd { generation } => {
                 self.group_reached_end(generation, &mut actions);
             }
@@ -1138,6 +1203,38 @@ impl Receiver {
             }
             self.active = next;
         }
+        self.evaluate_next_up(generation, position, actions);
+    }
+
+    /// Shows or hides the Next Up card for the current position.
+    fn evaluate_next_up(
+        &mut self,
+        generation: Generation,
+        position: Duration,
+        actions: &mut Vec<ReceiverAction>,
+    ) {
+        let start = self
+            .segments
+            .iter()
+            .find(|s| s.kind == SegmentKind::Outro)
+            .map(|s| s.start)
+            .or_else(|| self.duration.map(|d| d.saturating_sub(NEXT_UP_LEAD)));
+        let due = start.is_some_and(|start| position >= start);
+        let state = match (due, self.next_up) {
+            (false, _) => NextUpState::Hidden,
+            (true, NextUpState::Taken) => NextUpState::Taken,
+            (true, _) => NextUpState::Shown,
+        };
+        match (self.next_up, state) {
+            (NextUpState::Shown, NextUpState::Hidden) => {
+                actions.push(ReceiverAction::HideNextUp { generation });
+            }
+            (NextUpState::Hidden, NextUpState::Shown) => {
+                actions.push(ReceiverAction::ShowNextUp { generation });
+            }
+            _ => {}
+        }
+        self.next_up = state;
     }
 
     /// Stops mpv for whatever is current; a held hook is aborted first.
@@ -1182,9 +1279,16 @@ impl Receiver {
         {
             actions.push(ReceiverAction::HideSkipButton { generation });
         }
+        if self.next_up == NextUpState::Shown
+            && let Some(generation) = self.current_generation()
+        {
+            actions.push(ReceiverAction::HideNextUp { generation });
+        }
         self.segments.clear();
         self.active = None;
         self.dismissed = None;
+        self.duration = None;
+        self.next_up = NextUpState::Hidden;
         match mem::take(&mut self.playback) {
             // Loading sent no `ReportStarted`, and a stop without a start
             // resets the item's resume position on the server.
@@ -2060,7 +2164,10 @@ mod tests {
             seg(SegmentKind::Outro, 90, 110, false),
             seg(SegmentKind::Preview, 110, 120, false),
         ]);
-        assert_eq!(at(&mut r, g, 95), vec![show(g, SegmentKind::Outro)]);
+        assert_eq!(
+            at(&mut r, g, 95),
+            vec![show(g, SegmentKind::Outro), show_next(g)]
+        );
         assert_eq!(
             r.handle(ReceiverEvent::SkipRequested),
             vec![
@@ -2084,7 +2191,10 @@ mod tests {
             seg(SegmentKind::Outro, 90, 110, false),
             seg(SegmentKind::Preview, 110, 120, false),
         ]);
-        assert_eq!(at(&mut r, g, 109), vec![show(g, SegmentKind::Outro)]);
+        assert_eq!(
+            at(&mut r, g, 109),
+            vec![show(g, SegmentKind::Outro), show_next(g)]
+        );
         assert_eq!(
             at(&mut r, g, 111),
             vec![hide(g), show(g, SegmentKind::Preview)]
@@ -2102,7 +2212,7 @@ mod tests {
 
     #[test]
     fn item_end_hides_the_button() {
-        let (mut r, g) = playing_with(vec![seg(SegmentKind::Outro, 90, 110, false)]);
+        let (mut r, g) = playing_with(vec![seg(SegmentKind::Intro, 90, 110, false)]);
         at(&mut r, g, 95);
         let actions = r.handle(ended(g, EndReason::Eof));
         assert!(matches!(
@@ -2123,6 +2233,180 @@ mod tests {
         let g2 = begin_playing(&mut r, "b", 80);
         settle(&mut r, g2, 0);
         assert!(at(&mut r, g2, 10).is_empty());
+    }
+
+    fn show_next(g: Generation) -> ReceiverAction {
+        ReceiverAction::ShowNextUp { generation: g }
+    }
+
+    fn hide_next(g: Generation) -> ReceiverAction {
+        ReceiverAction::HideNextUp { generation: g }
+    }
+
+    fn length(r: &mut Receiver, g: Generation, secs: u64) -> Vec<ReceiverAction> {
+        r.handle(ReceiverEvent::PlayerDurationChanged {
+            generation: g,
+            duration: Some(Duration::from_secs(secs)),
+        })
+    }
+
+    fn played(g: Generation) -> ReceiverAction {
+        ReceiverAction::MarkPlayed {
+            generation: g,
+            item_id: "a".into(),
+        }
+    }
+
+    #[test]
+    fn next_up_comes_with_the_credits_and_outlasts_them() {
+        let (mut r, g) = playing_with(vec![seg(SegmentKind::Outro, 90, 110, false)]);
+        length(&mut r, g, 200);
+        assert!(at(&mut r, g, 89).is_empty());
+        assert_eq!(
+            at(&mut r, g, 90),
+            vec![show(g, SegmentKind::Outro), show_next(g)]
+        );
+        assert_eq!(
+            at(&mut r, g, 110),
+            vec![hide(g)],
+            "only the skip button goes"
+        );
+        assert!(at(&mut r, g, 150).is_empty());
+    }
+
+    #[test]
+    fn next_up_without_credits_is_the_last_thirty_seconds() {
+        let (mut r, g) = playing_with(vec![]);
+        assert!(length(&mut r, g, 120).is_empty());
+        assert!(at(&mut r, g, 89).is_empty());
+        assert_eq!(at(&mut r, g, 90), vec![show_next(g)]);
+    }
+
+    #[test]
+    fn late_credits_are_not_preempted_by_the_last_thirty_seconds() {
+        let (mut r, g) = playing_with(vec![seg(SegmentKind::Outro, 110, 120, true)]);
+        length(&mut r, g, 120);
+        assert!(at(&mut r, g, 100).is_empty());
+    }
+
+    #[test]
+    fn next_up_needs_credits_or_a_known_length() {
+        let (mut r, g) = playing_with(vec![]);
+        assert!(at(&mut r, g, 100_000).is_empty());
+    }
+
+    #[test]
+    fn learning_the_length_inside_the_window_shows_next_up() {
+        let (mut r, g) = playing_with(vec![]);
+        at(&mut r, g, 100);
+        assert_eq!(length(&mut r, g, 120), vec![show_next(g)]);
+    }
+
+    #[test]
+    fn a_stale_length_is_ignored() {
+        let (mut r, g) = playing_with(vec![]);
+        at(&mut r, g, 100);
+        assert!(length(&mut r, gen_(99), 120).is_empty());
+    }
+
+    #[test]
+    fn no_next_up_before_the_first_settled_position() {
+        let mut r = Receiver::new();
+        let g = begin_playing(&mut r, "a", 70);
+        length(&mut r, g, 120);
+        assert!(at(&mut r, g, 100).is_empty());
+        assert_eq!(settle(&mut r, g, 100).last(), Some(&show_next(g)));
+    }
+
+    #[test]
+    fn seeking_out_of_the_window_hides_next_up() {
+        let (mut r, g) = playing_with(vec![]);
+        length(&mut r, g, 120);
+        at(&mut r, g, 100);
+        assert_eq!(at(&mut r, g, 50), vec![hide_next(g)]);
+    }
+
+    #[test]
+    fn play_now_marks_played_and_moves_to_the_next_entry() {
+        let (mut r, g) = playing_with(vec![]);
+        length(&mut r, g, 120);
+        at(&mut r, g, 100);
+        assert_eq!(
+            r.handle(ReceiverEvent::NextUpRequested),
+            vec![played(g), hide_next(g), ReceiverAction::PlaylistNext]
+        );
+    }
+
+    #[test]
+    fn play_now_while_paused_starts_the_next_entry_playing() {
+        let (mut r, g) = playing_with(vec![]);
+        length(&mut r, g, 120);
+        at(&mut r, g, 100);
+        r.handle(ReceiverEvent::PlayerPauseChanged {
+            generation: g,
+            paused: true,
+        });
+        assert_eq!(
+            r.handle(ReceiverEvent::NextUpRequested),
+            vec![
+                played(g),
+                hide_next(g),
+                ReceiverAction::SetPaused {
+                    generation: g,
+                    paused: false
+                },
+                ReceiverAction::PlaylistNext
+            ]
+        );
+    }
+
+    #[test]
+    fn play_now_without_the_card_does_nothing() {
+        let (mut r, g) = playing_with(vec![]);
+        length(&mut r, g, 120);
+        at(&mut r, g, 10);
+        assert!(r.handle(ReceiverEvent::NextUpRequested).is_empty());
+        assert!(
+            Receiver::new()
+                .handle(ReceiverEvent::NextUpRequested)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_pressed_card_stays_gone_until_playback_leaves_the_window() {
+        let (mut r, g) = playing_with(vec![]);
+        length(&mut r, g, 120);
+        at(&mut r, g, 100);
+        r.handle(ReceiverEvent::NextUpRequested);
+        assert!(at(&mut r, g, 101).is_empty());
+        assert!(r.handle(ReceiverEvent::NextUpRequested).is_empty());
+        assert!(at(&mut r, g, 50).is_empty());
+        assert_eq!(at(&mut r, g, 100), vec![show_next(g)]);
+    }
+
+    #[test]
+    fn item_end_hides_next_up_and_the_next_item_starts_clean() {
+        let (mut r, g) = playing_with(vec![]);
+        length(&mut r, g, 120);
+        at(&mut r, g, 100);
+        let actions = r.handle(ended(g, EndReason::Eof));
+        assert!(
+            matches!(
+                actions.as_slice(),
+                [
+                    ReceiverAction::HideNextUp { .. },
+                    ReceiverAction::ReportStopped { .. }
+                ]
+            ),
+            "{actions:?}"
+        );
+        let g2 = begin_playing(&mut r, "b", 80);
+        settle(&mut r, g2, 0);
+        assert!(
+            at(&mut r, g2, 100).is_empty(),
+            "the old length is forgotten"
+        );
     }
 
     #[test]

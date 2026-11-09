@@ -648,6 +648,26 @@ fn skip_in_a_group_seeks_everyone() {
 
 #[test]
 #[ignore = "needs ./scripts/test-server.ps1 -Action up"]
+fn play_now_moves_the_whole_group() {
+    // The card's key section only reports active with mpv's default bindings on.
+    let r = room_adjusted(Server::connect(), |opts| opts.default_bindings = true);
+    // In E01's credits.
+    r.join_playing(&r.items[..2], secs(103));
+    r.wait_mpv("playlist-count", &json!(2));
+    poll_until(T10, || {
+        section_active(&r.player, "mpvfin-next-up-key").then_some(())
+    });
+
+    r.partner.clear();
+    r.player.command(&["script-binding", "mpvfin/next-up"]);
+    let queue = r.wait_queue_at(1);
+    assert_eq!(queue["Playlist"][1]["ItemId"], r.items[1]);
+    r.partner.wait_command("Unpause", T20);
+    r.wait_on(&r.items[1]);
+}
+
+#[test]
+#[ignore = "needs ./scripts/test-server.ps1 -Action up"]
 fn leaving_keeps_local_playback() {
     let (r, relay) = relayed_room();
     r.join_playing(&r.items[..1], secs(0));

@@ -11,7 +11,7 @@ use mpvfin_core::{
     Generation, GroupEntry, GroupRequest, GroupSummary, PlayerToken, Receiver, ReceiverAction,
     ReceiverEvent, ResolvedMedia, SegmentKind, StopReason, StreamSelection,
 };
-use mpvfin_jellyfin::{Job, Paths, Report, SessionEvent, SessionHandle};
+use mpvfin_jellyfin::{Job, Paths, Report, SessionEvent, SessionHandle, Thumbnail};
 
 use crate::adapter::{self, SubtitleStep, SubtitleWait, TrackKind};
 use crate::drift::{DriftAction, DriftCorrector};
@@ -23,7 +23,8 @@ use crate::ffi::{
 };
 use crate::group_menu::{self, ConsoleEvent, MenuItem, UoscEvent};
 use crate::mpv::{Mpv, from_c};
-use crate::skip_button::{self, CLICK_SECTION, KEY_SECTION};
+use crate::next_up;
+use crate::skip_button::{self, CLICK_SECTION, KEY_SECTION, Rect};
 
 /// Interval of the reducer's progress tick.
 const TICK: Duration = Duration::from_secs(10);
@@ -87,6 +88,7 @@ pub fn run(mpv: Mpv) -> c_int {
         "eof-reached",
         "paused-for-cache",
         "idle-active",
+        "duration",
     ] {
         mpv.observe(name, MPV_FORMAT_STRING);
     }
@@ -131,6 +133,8 @@ pub fn run(mpv: Mpv) -> c_int {
         subtitle_wait: None,
         skip_button: None,
         skip_sections_off_at: None,
+        next_up: None,
+        next_up_sections_off_at: None,
         resume_at: None,
         pending_seek: PendingSeek::default(),
         drift: DriftCorrector::new(),
@@ -247,6 +251,7 @@ struct Observed {
     osd_height: i64,
     speed: f64,
     eof_reached: bool,
+    duration: Option<Duration>,
 }
 
 /// The skip button on screen.
@@ -254,6 +259,24 @@ struct Observed {
 struct SkipButton {
     kind: SegmentKind,
     hovered: bool,
+}
+
+/// The Next Up card, from `ShowNextUp` until `HideNextUp`.
+#[derive(Default)]
+struct NextUp {
+    /// The next playlist entry, while it is a Jellyfin item.
+    item_id: Option<String>,
+    /// What the card says; the card is on screen once this is known.
+    label: Option<String>,
+    /// mpv has this memory's address while the card is on screen.
+    thumbnail: Option<Thumbnail>,
+    hovered: bool,
+}
+
+impl NextUp {
+    fn thumbnail_size(&self) -> Option<(u32, u32)> {
+        self.thumbnail.as_ref().map(|t| (t.width, t.height))
+    }
 }
 
 /// A playlist entry mpvfin resolves, from `ResolveMedia` until its end.
@@ -281,6 +304,9 @@ struct Runtime {
     skip_button: Option<SkipButton>,
     /// When the skip input sections go off; `None` leaves them as they are.
     skip_sections_off_at: Option<Instant>,
+    next_up: Option<NextUp>,
+    /// When the card's input sections go off; `None` leaves them as they are.
+    next_up_sections_off_at: Option<Instant>,
     /// When a group's scheduled start is due, for that generation.
     resume_at: Option<(Instant, Generation)>,
     pending_seek: PendingSeek,
@@ -315,6 +341,7 @@ impl Runtime {
             let wake = [
                 resolve,
                 self.skip_sections_off_at,
+                self.next_up_sections_off_at,
                 resume,
                 self.pending_seek.due_at(),
             ]
@@ -371,11 +398,13 @@ impl Runtime {
             self.drain();
             self.expire_resolve();
             self.expire_skip_sections();
+            self.expire_next_up_sections();
             self.expire_resume();
             self.expire_group_seek();
             if Instant::now() >= next_tick {
                 next_tick = Instant::now() + TICK;
                 self.feed(ReceiverEvent::ProgressTick);
+                self.refresh_next_up();
             }
         }
     }
@@ -387,6 +416,13 @@ impl Runtime {
                 self.feed(ReceiverEvent::SkipRequested);
                 if had_button && self.skip_button.is_none() {
                     self.skip_sections_off_at = Some(Instant::now() + SKIP_LINGER);
+                }
+            }
+            // Only with a card up: without one there may be no next entry to go to.
+            Some("next-up") if self.next_up_on_screen() => {
+                self.feed(ReceiverEvent::NextUpRequested);
+                if self.next_up.is_none() {
+                    self.next_up_sections_off_at = Some(Instant::now() + SKIP_LINGER);
                 }
             }
             Some("watch-together") => self.request_group_menu(),
@@ -456,6 +492,23 @@ impl Runtime {
         }
     }
 
+    fn expire_next_up_sections(&mut self) {
+        if self
+            .next_up_sections_off_at
+            .is_some_and(|at| Instant::now() >= at)
+        {
+            self.next_up_sections_off_at = None;
+            self.run(&skip_button::set_section_command(
+                next_up::KEY_SECTION,
+                false,
+            ));
+            self.run(&skip_button::set_section_command(
+                next_up::CLICK_SECTION,
+                false,
+            ));
+        }
+    }
+
     fn expire_resume(&mut self) {
         if let Some((at, generation)) = self.resume_at
             && Instant::now() >= at
@@ -522,7 +575,10 @@ impl Runtime {
         self.feed(ReceiverEvent::PlayerFileLoaded { generation });
         self.subtitle_wait = Some(SubtitleWait::new(generation, sub_adds, selection));
         self.advance_subtitles();
-        for name in ["pause", "volume", "mute", "aid"] {
+        // mpv delivers events ahead of property changes, and two items of the
+        // same length would send no change at all.
+        self.observed.duration = parse_position(self.mpv.get_property("duration").as_deref());
+        for name in ["pause", "volume", "mute", "aid", "duration"] {
             if let Some(event) = self.player_event(generation, name) {
                 self.feed(event);
             }
@@ -587,15 +643,16 @@ impl Runtime {
             }
             ("aid", _) => o.aid = value,
             ("sid", _) => o.sid = value,
+            ("duration", v) => o.duration = parse_position(v),
             ("osd-width", v) => {
                 o.osd_width = osd_length(v);
-                return self.skip_button_resized();
+                return self.overlays_resized();
             }
             ("osd-height", v) => {
                 o.osd_height = osd_length(v);
-                return self.skip_button_resized();
+                return self.overlays_resized();
             }
-            ("mouse-pos" | UOSC_MENU, _) => return self.update_skip_hover(),
+            ("mouse-pos" | UOSC_MENU, _) => return self.update_hover(),
             ("speed", v) => {
                 if let Some(speed) = v.and_then(|v| v.parse().ok()) {
                     o.speed = speed;
@@ -706,6 +763,10 @@ impl Runtime {
                 position: o.position,
                 seek_completed: false,
             },
+            "duration" => ReceiverEvent::PlayerDurationChanged {
+                generation,
+                duration: o.duration,
+            },
             "aid" | "sid" => {
                 let tracks = &self.media(generation)?.0.tracks;
                 // "no" and "auto" are not track ids, so they map to `None`.
@@ -755,6 +816,11 @@ impl Runtime {
                     self.open_group_menu(&groups);
                 }
                 SessionEvent::GroupListFailed => self.group_list_pending = false,
+                SessionEvent::NextUpCard {
+                    item_id,
+                    label,
+                    thumbnail,
+                } => self.next_up_ready(&item_id, label, thumbnail),
             }
         }
     }
@@ -941,6 +1007,16 @@ impl Runtime {
             }
             ReceiverAction::ShowSkipButton { kind, .. } => self.show_skip_button(kind),
             ReceiverAction::HideSkipButton { .. } => self.hide_skip_button(),
+            ReceiverAction::ShowNextUp { .. } => {
+                self.next_up = Some(NextUp::default());
+                self.refresh_next_up();
+            }
+            ReceiverAction::HideNextUp { .. } => {
+                if self.next_up_on_screen() {
+                    self.remove_next_up_card();
+                }
+                self.next_up = None;
+            }
             ReceiverAction::SeekToEnd { .. } => {
                 self.run(&["seek", "100", "absolute-percent+exact"]);
                 // mpv holds a paused last frame; only unpausing ends the item.
@@ -1043,7 +1119,10 @@ impl Runtime {
             self.mpv.log("mpv reported no client name: no skip input");
             return;
         };
-        for command in skip_button::define_section_commands(&client) {
+        for command in skip_button::define_section_commands(&client)
+            .into_iter()
+            .chain(next_up::define_section_commands(&client))
+        {
             self.run(&command);
         }
     }
@@ -1082,9 +1161,149 @@ impl Runtime {
         }
     }
 
-    fn skip_button_resized(&mut self) {
+    fn overlays_resized(&mut self) {
         self.draw_skip_button();
+        self.draw_next_up();
+        self.place_thumbnail();
+        self.update_hover();
+    }
+
+    fn update_hover(&mut self) {
         self.update_skip_hover();
+        self.update_next_up_hover();
+    }
+
+    /// Follows mpv's playlist, whoever changes it, while the card is due.
+    fn refresh_next_up(&mut self) {
+        let Some(card) = &self.next_up else {
+            return;
+        };
+        let on_screen = card.label.is_some();
+        let next = self.next_playlist_item();
+        if next == card.item_id {
+            return;
+        }
+        if on_screen {
+            self.remove_next_up_card();
+        }
+        if let Some(item_id) = next.clone() {
+            self.session.submit(Job::NextUpCard { item_id });
+        }
+        self.next_up = Some(NextUp {
+            item_id: next,
+            ..NextUp::default()
+        });
+    }
+
+    fn next_playlist_item(&self) -> Option<String> {
+        let playing = self.mpv.get_property("playlist-playing-pos")?;
+        let next = playing.parse::<i64>().ok()? + 1;
+        let uri = self
+            .mpv
+            .get_property(&format!("playlist/{next}/filename"))?;
+        adapter::entry_from_uri(&uri).map(|(item_id, _)| item_id.to_owned())
+    }
+
+    fn next_up_on_screen(&self) -> bool {
+        self.next_up.as_ref().is_some_and(|c| c.label.is_some())
+    }
+
+    fn next_up_ready(&mut self, item_id: &str, label: String, thumbnail: Option<Thumbnail>) {
+        let Some(card) = self
+            .next_up
+            .as_mut()
+            .filter(|card| card.item_id.as_deref() == Some(item_id))
+        else {
+            return;
+        };
+        card.label = Some(label);
+        card.thumbnail = thumbnail;
+        // A pending disable ends here; the click section must follow the pointer again.
+        if self.next_up_sections_off_at.take().is_some() {
+            self.run(&skip_button::set_section_command(
+                next_up::CLICK_SECTION,
+                false,
+            ));
+        }
+        self.run(&skip_button::set_section_command(
+            next_up::KEY_SECTION,
+            true,
+        ));
+        self.draw_next_up();
+        self.place_thumbnail();
+        // The pointer may already be there, and a still pointer sends no change.
+        self.update_next_up_hover();
+    }
+
+    /// The input goes at once, unless the press that hid the card pushes this back.
+    fn remove_next_up_card(&mut self) {
+        self.run(&next_up::clear_command());
+        if self
+            .next_up
+            .as_ref()
+            .is_some_and(|card| card.thumbnail.is_some())
+        {
+            self.run(&next_up::remove_thumbnail_command());
+        }
+        self.next_up_sections_off_at = Some(Instant::now());
+    }
+
+    fn next_up_layout(&self) -> Option<next_up::Layout> {
+        let card = self.next_up.as_ref()?;
+        let (w, h) = osd_size(&self.observed);
+        Some(next_up::layout(
+            card.label.as_ref()?,
+            card.thumbnail_size(),
+            w,
+            h,
+        ))
+    }
+
+    fn draw_next_up(&self) {
+        if let Some(card) = &self.next_up
+            && let Some(label) = &card.label
+        {
+            let (w, h) = osd_size(&self.observed);
+            self.run(&next_up::draw_command(
+                label,
+                card.thumbnail_size(),
+                w,
+                h,
+                card.hovered,
+            ));
+        }
+    }
+
+    fn place_thumbnail(&self) {
+        if let Some(card) = &self.next_up
+            && let Some(picture) = &card.thumbnail
+            && let Some(at) = self.next_up_layout().and_then(|layout| layout.thumbnail)
+        {
+            let size = (picture.width, picture.height);
+            self.run(&next_up::thumbnail_command(&picture.bgra, size, at));
+        }
+    }
+
+    /// Rereads the pointer while the card is up; when it crosses Play Now's
+    /// edge, moves the click section and redraws.
+    fn update_next_up_hover(&mut self) {
+        let (Some(layout), Some(was)) = (
+            self.next_up_layout(),
+            self.next_up.as_ref().map(|card| card.hovered),
+        ) else {
+            return;
+        };
+        let hovered = !self.uosc_menu_open() && self.pointer_over(layout.play);
+        if hovered != was {
+            if let Some(card) = &mut self.next_up {
+                card.hovered = hovered;
+            }
+            self.run(&skip_button::set_section_command(
+                next_up::CLICK_SECTION,
+                hovered,
+            ));
+            self.draw_next_up();
+        }
     }
 
     /// Rereads the pointer while a button is up; when it crosses the button's
@@ -1093,12 +1312,8 @@ impl Runtime {
         let Some(button) = self.skip_button else {
             return;
         };
-        // uosc's menu draws over the button and owns the click there.
-        let menu_open = self
-            .mpv
-            .get_property(UOSC_MENU)
-            .is_some_and(|menu| menu != "null");
-        let hovered = !menu_open && self.pointer_over_skip_button();
+        let (w, h) = osd_size(&self.observed);
+        let hovered = !self.uosc_menu_open() && self.pointer_over(skip_button::button_rect(w, h));
         if hovered != button.hovered {
             self.skip_button = Some(SkipButton { hovered, ..button });
             self.run(&skip_button::set_section_command(CLICK_SECTION, hovered));
@@ -1106,13 +1321,19 @@ impl Runtime {
         }
     }
 
-    fn pointer_over_skip_button(&self) -> bool {
+    /// uosc's menu draws over the buttons and owns the click there.
+    fn uosc_menu_open(&self) -> bool {
+        self.mpv
+            .get_property(UOSC_MENU)
+            .is_some_and(|menu| menu != "null")
+    }
+
+    fn pointer_over(&self, rect: Rect) -> bool {
         let coordinate = |name| self.mpv.get_property(name)?.parse::<i64>().ok();
-        let (w, h) = osd_size(&self.observed);
         self.mpv.get_property("mouse-pos/hover").as_deref() == Some("yes")
             && coordinate("mouse-pos/x")
                 .zip(coordinate("mouse-pos/y"))
-                .is_some_and(|(x, y)| skip_button::button_rect(w, h).contains(x, y))
+                .is_some_and(|(x, y)| rect.contains(x, y))
     }
 
     /// Runs an mpv command; a failure is logged.

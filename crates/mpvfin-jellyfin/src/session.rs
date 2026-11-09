@@ -24,7 +24,7 @@ use tungstenite::{Message, WebSocket};
 use crate::client::{Client, HttpError, reconnect_delay, sanitize};
 use crate::config::{BaseUrl, parse_config};
 use crate::identity::{auth_header, device_name, pct};
-use crate::negotiate::{capabilities_body, playback_info_body, resolve_media};
+use crate::negotiate::{capabilities_body, playback_info_body, resolve_media, short_title};
 use crate::proxy::{Proxy, TokenSource};
 use crate::report::{progress_body, started_body, stopped_body};
 use crate::segments::{parse_segments, segments_path};
@@ -32,6 +32,7 @@ use crate::state::{LockError, State, StateFile};
 use crate::syncplay::{
     GroupUpdate, clock_sample, parse_groups, parse_utc_ms, request_path_and_body,
 };
+use crate::thumbnail::{MAX_THUMBNAIL_BYTES, Thumbnail, decode_thumbnail, thumbnail_path};
 use crate::wire::{Inbound, parse_inbound};
 
 /// `/GetUtcTime` samples per clock batch.
@@ -76,6 +77,15 @@ pub enum SessionEvent {
     GroupList(Vec<GroupSummary>),
     /// [`Job::ListGroups`] failed; the viewer has been told.
     GroupListFailed,
+    /// The answer to [`Job::NextUpCard`].
+    NextUpCard {
+        /// The item asked about.
+        item_id: String,
+        /// What the Next Up card should say.
+        label: String,
+        /// The item's picture, if it has one.
+        thumbnail: Option<Thumbnail>,
+    },
 }
 
 /// Receives session events from the session threads; must not block.
@@ -118,6 +128,11 @@ pub enum Job {
     Group(GroupRequest),
     /// `GET /SyncPlay/List`, answered with `GroupList`; runs on the group thread.
     ListGroups,
+    /// Look up an item's title and picture; always answered with `NextUpCard`.
+    NextUpCard {
+        /// Jellyfin item id.
+        item_id: String,
+    },
 }
 
 /// The running session; dropping it without `shutdown` detaches the threads.
@@ -926,6 +941,19 @@ fn work(
                     });
                 }
             }
+            // On its own thread, so a stalled reply can't delay the next item's resolve.
+            Job::NextUpCard { item_id } => {
+                let s = sink.clone();
+                spawn("next-up", sink, move || {
+                    let label = next_up_label(current.as_ref(), &item_id, &s);
+                    let thumbnail = next_up_thumbnail(current.as_ref(), &item_id);
+                    s(SessionEvent::NextUpCard {
+                        item_id,
+                        label,
+                        thumbnail,
+                    });
+                });
+            }
             Job::MarkPlayed { item_id } => {
                 let Some(c) = current else {
                     continue;
@@ -956,6 +984,29 @@ fn work(
             }
         }
     }
+}
+
+/// The item's picture. Plenty of items have none, so failing is unremarkable.
+fn next_up_thumbnail(creds: Option<&Creds>, item_id: &str) -> Option<Thumbnail> {
+    let jpeg = creds?
+        .client
+        .get_bytes(&thumbnail_path(item_id), MAX_THUMBNAIL_BYTES)
+        .ok()?;
+    decode_thumbnail(&jpeg)
+}
+
+/// The item's short title, or a generic one: Play Now works without a title.
+fn next_up_label(creds: Option<&Creds>, item_id: &str, sink: &Sink) -> String {
+    let item = creds.and_then(|c| {
+        let path = format!("/Items/{}?userId={}", pct(item_id), pct(&c.user_id));
+        c.client
+            .get(&path)
+            .map_err(|e| log(sink, format!("next item's title unavailable: {e}")))
+            .ok()
+    });
+    item.map(|item| short_title(&item))
+        .filter(|title| !title.is_empty())
+        .unwrap_or_else(|| "Next item".to_owned())
 }
 
 /// The resolved media and the item's `RunTimeTicks`.

@@ -11,6 +11,7 @@ pub mod segments;
 pub mod session;
 pub mod state;
 pub mod syncplay;
+pub mod thumbnail;
 pub mod wire;
 
 pub use config::{BaseUrl, Config, parse_config};
@@ -25,4 +26,5 @@ pub use syncplay::{
     GroupUpdate, ZERO_ID, clock_sample, format_utc, parse_group_message, parse_groups,
     parse_utc_ms, request_path_and_body,
 };
+pub use thumbnail::Thumbnail;
 pub use wire::{Inbound, duration_to_ticks, parse_inbound, ticks_to_duration};

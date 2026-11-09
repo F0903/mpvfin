@@ -32,6 +32,10 @@ const TICK: Duration = Duration::from_secs(10);
 /// continues, so this bounds quitting while the server stalls.
 const RESOLVE_DEADLINE: Duration = Duration::from_secs(4);
 
+/// The same while grouped, where a failed resolve ejects the viewer: a resolve
+/// is two requests and one alone can take 3.6 s. Quitting can take this long.
+const GROUP_RESOLVE_DEADLINE: Duration = Duration::from_secs(12);
+
 /// How long the skip input stays ours after a skip press, so the second press
 /// of a double press can't reach mpv's own bindings.
 const SKIP_LINGER: Duration = Duration::from_millis(400);
@@ -371,7 +375,7 @@ impl Runtime {
     }
 
     /// mpv sends SHUTDOWN only after every hook continued, so none is held
-    /// here (`RESOLVE_DEADLINE` bounds that wait); this queues the final stop report.
+    /// here (the resolve deadlines bound that wait); this queues the final stop report.
     fn shutdown(mut self) -> c_int {
         self.feed(ReceiverEvent::Shutdown);
         self.mpv.waker().disarm();
@@ -798,9 +802,14 @@ impl Runtime {
                     keep_open_before: None,
                 };
                 self.entries.insert(token.entry_id, entry);
+                let allowed = if self.receiver.group_id().is_some() {
+                    GROUP_RESOLVE_DEADLINE
+                } else {
+                    RESOLVE_DEADLINE
+                };
                 self.pending_resolve = Some(PendingResolve {
                     generation,
-                    deadline: Instant::now() + RESOLVE_DEADLINE,
+                    deadline: Instant::now() + allowed,
                     expired: false,
                 });
                 self.session.submit(Job::Resolve {

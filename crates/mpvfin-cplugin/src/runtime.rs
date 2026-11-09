@@ -608,10 +608,20 @@ impl Runtime {
             DriftAction::SetSpeed(speed) | DriftAction::RestoreSpeed(speed) => {
                 self.set("file-local-options/speed", &speed.to_string());
             }
-            DriftAction::Seek(position) => self.feed(ReceiverEvent::DriftSeek {
-                generation,
-                position,
-            }),
+            DriftAction::Seek(position) => {
+                // The group's clock can run past the end of the file.
+                let duration = parse_position(self.mpv.get_property("duration").as_deref());
+                self.feed(ReceiverEvent::DriftSeek {
+                    generation,
+                    position: position.min(duration.unwrap_or(position)),
+                });
+            }
+            DriftAction::Resync => {
+                // A running speed correction goes back now; the server's answer re-anchors.
+                let restore = self.drift.anchor(None, Instant::now());
+                self.apply_drift(generation, restore);
+                self.feed(ReceiverEvent::DriftLost);
+            }
         }
     }
 

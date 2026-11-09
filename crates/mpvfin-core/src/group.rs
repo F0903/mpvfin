@@ -551,6 +551,14 @@ impl Receiver {
         }
     }
 
+    /// Unpause in Playing is resent to the caller with a fresh position, which
+    /// re-anchors; not counted as ours, or that position would be ignored.
+    pub(super) fn group_drift_lost(&self, actions: &mut Vec<ReceiverAction>) {
+        if self.group.as_ref().is_some_and(|g| !g.expected_paused) {
+            actions.push(ReceiverAction::Group(GroupRequest::Unpause));
+        }
+    }
+
     pub(super) fn group_opened_foreign(&mut self, actions: &mut Vec<ReceiverAction>) {
         if self.group.is_some() {
             self.group_leave(actions);
@@ -1545,6 +1553,29 @@ mod tests {
             r.handle(ReceiverEvent::PlayerStoppedEarly { generation: g })
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn a_lost_drift_clock_asks_the_server_where_the_group_is() {
+        let (mut r, g) = playing(&["p1"], 10);
+        assert_eq!(
+            r.handle(ReceiverEvent::DriftLost),
+            vec![req(GroupRequest::Unpause)]
+        );
+        // Not counted as ours, so the fresh position in the resend is obeyed.
+        let actions = r.handle(command(GroupCommandKind::Unpause, "p1", secs(50), 0));
+        assert!(actions.contains(&seek(g, secs(50))), "{actions:?}");
+        assert!(actions.contains(&anchor(g, secs(50))), "{actions:?}");
+    }
+
+    #[test]
+    fn a_lost_drift_clock_means_nothing_unless_the_group_is_playing() {
+        let (mut r, _) = following("p1", 10);
+        assert!(r.handle(ReceiverEvent::DriftLost).is_empty(), "paused");
+
+        let mut r = Receiver::new();
+        begin_playing(&mut r, "a", 70);
+        assert!(r.handle(ReceiverEvent::DriftLost).is_empty(), "no group");
     }
 
     #[test]

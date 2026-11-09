@@ -420,6 +420,8 @@ pub enum ReceiverEvent {
         /// Where the group is now.
         position: Duration,
     },
+    /// The drift corrector lost the group's clock to a time jump.
+    DriftLost,
     /// Jellyfin returned the item's media segments.
     SegmentsResolved {
         /// Generation attached to the request.
@@ -1018,6 +1020,7 @@ impl Receiver {
                 generation,
                 position,
             } => self.group_drift_seek(generation, position, &mut actions),
+            ReceiverEvent::DriftLost => self.group_drift_lost(&mut actions),
             ReceiverEvent::GroupCreate { name } => self.group_create(name, &mut actions),
             ReceiverEvent::GroupJoin { group_id } => self.group_join(group_id, &mut actions),
             ReceiverEvent::GroupLeave => self.group_leave(&mut actions),

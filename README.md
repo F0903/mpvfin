@@ -154,3 +154,8 @@ deletes its data.
 
 See [docs/architecture.md](docs/architecture.md) for how it works and
 [docs/jellyfin-protocol.md](docs/jellyfin-protocol.md) for the wire contract.
+
+## License
+
+mpvfin is licensed under the GNU General Public License, version 3 or (at your
+option) any later version. See [LICENSE](LICENSE).

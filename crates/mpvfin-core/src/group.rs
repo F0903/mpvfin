@@ -100,10 +100,13 @@ impl Receiver {
     }
 
     pub(super) fn group_joined(&mut self, group_id: String, actions: &mut Vec<ReceiverAction>) {
-        if self.group.replace(Group::new(group_id)).is_some() {
+        let rejoined = self.group.replace(Group::new(group_id)).is_some();
+        if rejoined {
             self.stop_following(actions);
         }
+        // A rejoin is not the group a failed create asked for; its queue stays.
         if mem::take(&mut self.creating_group)
+            && !rejoined
             && let Some(position) = self.playing_position()
         {
             actions.push(ReceiverAction::GroupPublishQueue { position });
@@ -1010,6 +1013,28 @@ mod tests {
                 group_id: "g".into()
             })
             .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_failed_create_while_grouped_does_not_publish_on_the_rejoin() {
+        let (mut r, g) = following("p1", 10);
+        r.handle(ReceiverEvent::GroupCreate { name: "m".into() });
+        // The New failed, then the socket came back and rejoined the old group.
+        assert_eq!(
+            r.handle(ReceiverEvent::GroupJoined {
+                group_id: "g".into()
+            }),
+            stop_following(g),
+            "a SetNewQueue here would replace the queue for everyone"
+        );
+        r.handle(ReceiverEvent::GroupLeft);
+        assert!(
+            r.handle(ReceiverEvent::GroupJoined {
+                group_id: "h".into()
+            })
+            .is_empty(),
+            "the rejoin used the create up"
         );
     }
 

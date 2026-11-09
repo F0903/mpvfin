@@ -5,9 +5,10 @@ use std::time::{Duration, Instant};
 use jellyfin::SegmentKind;
 
 use super::playlist::entry_from_uri;
-use super::{NextUp, Runtime, SkipButton, osd_size};
+use super::{NextUp, Runtime, SkipButton};
 use crate::next_up;
 use crate::next_up::thumbnail::Thumbnail;
+use crate::runtime::values::osd_size;
 use crate::server::session::Job;
 use crate::skip_button::{self, CLICK_SECTION, KEY_SECTION, Rect};
 

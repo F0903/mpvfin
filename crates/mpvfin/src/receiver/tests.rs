@@ -1,4 +1,6 @@
-use jellyfin::{PlayMethod, PlaybackProgress, QueueRequest, RemoteCommand, TrackMap};
+use jellyfin::{
+    PlayMethod, PlaybackProgress, QueueRequest, RemoteCommand, ResolvedMedia, TrackMap,
+};
 
 use super::*;
 

@@ -18,7 +18,7 @@ mod segments;
 use std::mem;
 use std::time::Duration;
 
-use jellyfin::{GroupRequest, QueueMode, ResolvedMedia, Segment, SegmentKind, StreamSelection};
+use jellyfin::{GroupRequest, QueueMode, Segment, SegmentKind, StreamSelection};
 
 use crate::receiver::segments::NextUpState;
 
@@ -462,130 +462,6 @@ impl Receiver {
         }
 
         actions
-    }
-
-    fn allocate_generation(&mut self) -> Generation {
-        let generation = Generation(self.next_generation);
-        self.next_generation = self
-            .next_generation
-            .checked_add(1)
-            .expect("playback generation counter exhausted");
-        generation
-    }
-
-    fn initial_snapshot(generation: Generation, media: &ResolvedMedia) -> PlaybackSnapshot {
-        PlaybackSnapshot {
-            generation,
-            item_id: media.item_id.clone(),
-            play_session_id: media.play_session_id.clone(),
-            media_source_id: media.media_source_id.clone(),
-            play_method: media.play_method,
-            position: Duration::ZERO,
-            paused: false,
-            volume_percent: 100,
-            muted: false,
-            audio_stream_index: None,
-            subtitle_stream_index: None,
-        }
-    }
-
-    fn playing_mut(&mut self, generation: Generation) -> Option<&mut PlaybackSnapshot> {
-        match &mut self.playback {
-            PlaybackState::Playing(snapshot) if snapshot.generation == generation => Some(snapshot),
-            _ => None,
-        }
-    }
-
-    fn playing_generation(&self) -> Option<Generation> {
-        match &self.playback {
-            PlaybackState::Playing(snapshot) => Some(snapshot.generation),
-            _ => None,
-        }
-    }
-
-    fn current_generation(&self) -> Option<Generation> {
-        match &self.playback {
-            PlaybackState::Idle => None,
-            PlaybackState::Resolving { generation, .. }
-            | PlaybackState::Loading { generation, .. } => Some(*generation),
-            PlaybackState::Playing(snapshot) => Some(snapshot.generation),
-        }
-    }
-
-    fn current_item_id(&self) -> Option<String> {
-        match &self.playback {
-            PlaybackState::Idle => None,
-            PlaybackState::Resolving { item_id, .. } => Some(item_id.clone()),
-            PlaybackState::Loading { media, .. } => Some(media.item_id.clone()),
-            PlaybackState::Playing(snapshot) => Some(snapshot.item_id.clone()),
-        }
-    }
-
-    /// Stops mpv for whatever is current; a held hook is aborted first.
-    fn stop_player(&mut self, actions: &mut Vec<ReceiverAction>) {
-        match &self.playback {
-            PlaybackState::Idle => {}
-            PlaybackState::Loading { generation, .. } => {
-                actions.push(ReceiverAction::StopPlayer {
-                    generation: *generation,
-                });
-            }
-            PlaybackState::Playing(snapshot) => {
-                actions.push(ReceiverAction::StopPlayer {
-                    generation: snapshot.generation,
-                });
-            }
-            PlaybackState::Resolving { generation, .. } => {
-                let generation = *generation;
-                self.terminate_current(StopReason::Stopped, actions);
-                actions.push(ReceiverAction::StopPlayer { generation });
-            }
-        }
-    }
-
-    fn control_pause(&self, paused: bool, actions: &mut Vec<ReceiverAction>) {
-        // A no-op must stay one: re-pausing would back up `pause=yes` per file.
-        if let PlaybackState::Playing(snapshot) = &self.playback
-            && snapshot.paused != paused
-        {
-            actions.push(ReceiverAction::SetPaused {
-                generation: snapshot.generation,
-                paused,
-            });
-        }
-    }
-
-    /// Goes idle. Resolving continues its hook with an abort; Playing reports
-    /// a stop. mpv owns the actual entry, so no `StopPlayer`.
-    fn terminate_current(&mut self, reason: StopReason, actions: &mut Vec<ReceiverAction>) {
-        if self.active.is_some()
-            && let Some(generation) = self.current_generation()
-        {
-            actions.push(ReceiverAction::HideSkipButton { generation });
-        }
-        if self.next_up == NextUpState::Shown
-            && let Some(generation) = self.current_generation()
-        {
-            actions.push(ReceiverAction::HideNextUp { generation });
-        }
-        self.segments.clear();
-        self.active = None;
-        self.dismissed = None;
-        self.duration = None;
-        self.next_up = NextUpState::Hidden;
-        match mem::take(&mut self.playback) {
-            // Loading sent no `ReportStarted`, and a stop without a start
-            // resets the item's resume position on the server.
-            PlaybackState::Idle | PlaybackState::Loading { .. } => {}
-            PlaybackState::Resolving { token, .. } => {
-                actions.push(ReceiverAction::AbortLoad {
-                    hook_id: token.hook_id,
-                });
-            }
-            PlaybackState::Playing(snapshot) => {
-                actions.push(ReceiverAction::ReportStopped { snapshot, reason });
-            }
-        }
     }
 }
 

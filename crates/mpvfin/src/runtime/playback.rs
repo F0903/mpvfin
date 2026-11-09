@@ -3,14 +3,15 @@
 
 use std::ffi::c_int;
 
+use super::Runtime;
 use super::load::{
     SubtitleStep, SubtitleWait, TrackKind, is_true_end, selection_commands, sub_add_commands,
     track_command,
 };
 use super::overlays::UOSC_MENU;
 use super::playlist::entry_from_uri;
-use super::{Runtime, osd_length, parse_position, percent};
 use crate::receiver::{Generation, PlayerToken, ReceiverEvent};
+use crate::runtime::values::{osd_length, parse_position, percent};
 
 impl Runtime {
     pub(super) fn on_load(&mut self, hook_id: u64) {

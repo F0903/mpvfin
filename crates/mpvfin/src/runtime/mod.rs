@@ -11,11 +11,12 @@ mod mpv;
 mod overlays;
 mod playback;
 mod playlist;
+mod start;
+mod values;
 
 use std::collections::HashMap;
 use std::ffi::c_int;
-use std::path::PathBuf;
-use std::sync::{Arc, mpsc};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use jellyfin::{ResolvedMedia, SegmentKind, StreamSelection};
@@ -23,13 +24,15 @@ use jellyfin::{ResolvedMedia, SegmentKind, StreamSelection};
 use self::event::{Event, key_press_name};
 use self::load::{SubtitleWait, end_reason};
 use self::mpv::Mpv;
-use self::mpv::ffi::{MPV_FORMAT_NONE, MPV_FORMAT_STRING};
-use self::overlays::{SKIP_LINGER, UOSC_MENU};
+use self::overlays::SKIP_LINGER;
 use crate::next_up::thumbnail::Thumbnail;
 use crate::receiver::{Generation, Receiver, ReceiverEvent};
-use crate::server::session::{self, Paths, SessionEvent, SessionHandle};
+use crate::runtime::values::parse_position;
+use crate::server::session::{SessionEvent, SessionHandle};
 use crate::watch_together::drift::DriftCorrector;
 use crate::watch_together::menu::{self, ConsoleEvent, MenuItem, UoscEvent};
+
+pub use start::open;
 
 /// Interval of the reducer's progress tick.
 const TICK: Duration = Duration::from_secs(10);
@@ -50,98 +53,6 @@ const MESSAGE_DURATION: Duration = Duration::from_secs(5);
 struct PendingSeek(Option<(Instant, Duration)>);
 
 pub(crate) use mpv::ffi::MpvHandle;
-
-/// Starts the plugin on mpv's handle and runs it until mpv shuts down.
-///
-/// # Safety
-///
-/// `handle` must be mpv's live client handle, for the length of this call,
-/// with the `pfn_mpv_*` slots filled.
-pub unsafe fn open(handle: *mut MpvHandle) -> c_int {
-    // SAFETY: per this function's contract the handle is live for this
-    // call, and `run` consumes the `Mpv`, so it is dropped before we return.
-    let Some(mpv) = (unsafe { Mpv::new(handle) }) else {
-        eprintln!("[mpvfin] mpv did not initialize the required C-plugin symbols");
-        return -1;
-    };
-    run(mpv)
-}
-
-/// Runs the plugin until mpv shuts down; the entry point's return value.
-fn run(mpv: Mpv) -> c_int {
-    mpv.log("loaded");
-    for name in [
-        "pause",
-        "volume",
-        "mute",
-        "time-pos",
-        "aid",
-        "sid",
-        "osd-width",
-        "osd-height",
-        "speed",
-        "eof-reached",
-        "paused-for-cache",
-        "idle-active",
-        "duration",
-    ] {
-        mpv.observe(name, MPV_FORMAT_STRING);
-    }
-    // Only a change signal: the coordinates are read while a button is up.
-    for name in ["mouse-pos", UOSC_MENU] {
-        mpv.observe(name, MPV_FORMAT_NONE);
-    }
-    mpv.hook_add("on_load", 50);
-    // Left unexpanded on failure: such a path never exists, so the session
-    // reports that no server is configured.
-    let path = |file: &str| {
-        PathBuf::from(
-            mpv.command_string_result(&["expand-path", file])
-                .unwrap_or_else(|| file.to_owned()),
-        )
-    };
-    let paths = Paths {
-        config_file: path("~~/script-opts/mpvfin.conf"),
-        state_file: path("~~/script-opts/mpvfin-state.json"),
-    };
-    // Under a regular file, so mpv can never create it.
-    let watch_later_dir = paths.state_file.join("watch_later").display().to_string();
-    let (tx, rx) = mpsc::channel();
-    let waker = mpv.waker();
-    let session = session::start(
-        paths,
-        Arc::new(move |event| {
-            let _ = tx.send(event);
-            waker.wake();
-        }),
-    );
-    let mut runtime = Runtime {
-        mpv,
-        session,
-        rx,
-        receiver: Receiver::new(),
-        entries: HashMap::new(),
-        current: None,
-        observed: Observed::default(),
-        pending_resolve: None,
-        watch_later_dir,
-        subtitle_wait: None,
-        skip_button: None,
-        skip_sections_off_at: None,
-        next_up: None,
-        next_up_sections_off_at: None,
-        resume_at: None,
-        pending_seek: PendingSeek::default(),
-        drift: DriftCorrector::new(),
-        drift_generation: None,
-        seeking: false,
-        group_list_pending: false,
-        menu_items: None,
-    };
-    runtime.define_skip_sections();
-    runtime.event_loop();
-    runtime.shutdown()
-}
 
 /// Latest values of the observed properties.
 #[derive(Default)]
@@ -466,63 +377,5 @@ impl Runtime {
         if let Err(e) = self.mpv.set_property(name, value) {
             self.mpv.log(&e);
         }
-    }
-}
-
-/// A `time-pos` value; `None` when unavailable.
-fn parse_position(value: Option<&str>) -> Option<Duration> {
-    value
-        .and_then(|v| v.parse::<f64>().ok())
-        .and_then(|secs| Duration::try_from_secs_f64(secs.max(0.0)).ok())
-}
-
-fn yes_no(flag: bool) -> &'static str {
-    if flag { "yes" } else { "no" }
-}
-
-/// An `osd-width` or `osd-height` value; 0 when missing or unparsable.
-fn osd_length(value: Option<&str>) -> i64 {
-    value.and_then(|v| v.parse().ok()).unwrap_or(0)
-}
-
-/// The OSD size to lay the button out on: without a video output mpv
-/// reports none, and the hit test must still work.
-fn osd_size(observed: &Observed) -> (i64, i64) {
-    match (observed.osd_width, observed.osd_height) {
-        (w, h) if w > 0 && h > 0 => (w, h),
-        _ => (1280, 720),
-    }
-}
-
-/// mpv's volume (up to 130) as a Jellyfin percentage.
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // clamped to 0..=100 first
-fn percent(volume: f64) -> u8 {
-    volume.clamp(0.0, 100.0).round() as u8
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_missing_or_zero_osd_counts_as_720p() {
-        let size = |osd_width, osd_height| {
-            osd_size(&Observed {
-                osd_width,
-                osd_height,
-                ..Observed::default()
-            })
-        };
-        assert_eq!(size(1920, 1080), (1920, 1080));
-        assert_eq!(size(0, 0), (1280, 720));
-        assert_eq!(size(1920, 0), (1280, 720));
-        assert_eq!(osd_length(None), 0);
-        assert_eq!(osd_length(Some("1920")), 1920);
-    }
-    #[test]
-    fn volume_is_clamped_and_rounded() {
-        assert_eq!(percent(130.0), 100);
-        assert_eq!(percent(-1.0), 0);
-        assert_eq!(percent(49.6), 50);
     }
 }

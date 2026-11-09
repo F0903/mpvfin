@@ -8,9 +8,10 @@ use super::load::{TrackKind, group_hook_properties, hook_properties, seek_comman
 use super::playlist::{group_sync_commands, queue_commands};
 use super::{
     Entry, GROUP_RESOLVE_DEADLINE, MESSAGE_DURATION, NextUp, PendingResolve, PendingSeek,
-    RESOLVE_DEADLINE, Runtime, yes_no,
+    RESOLVE_DEADLINE, Runtime,
 };
 use crate::receiver::{ReceiverAction, StopReason};
+use crate::runtime::values::yes_no;
 use crate::server::session::{Job, Report};
 
 impl Runtime {

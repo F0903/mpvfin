@@ -7,8 +7,9 @@ use jellyfin::{GroupEntry, GroupRequest, GroupSummary};
 
 use super::load::GROUP_KEEP_OPEN;
 use super::playlist::{group_load_commands, published_queue};
-use super::{MESSAGE_DURATION, PendingSeek, Runtime, parse_position};
+use super::{MESSAGE_DURATION, PendingSeek, Runtime};
 use crate::receiver::{Generation, ReceiverEvent};
+use crate::runtime::values::parse_position;
 use crate::server::session::Job;
 use crate::watch_together::drift::DriftAction;
 use crate::watch_together::menu;

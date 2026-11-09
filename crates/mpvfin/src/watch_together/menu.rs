@@ -1,8 +1,9 @@
 //! Pure entries, commands and replies of the watch-together menu.
 
-use crate::receiver::ReceiverEvent;
 use jellyfin::GroupSummary;
 use serde_json::{Value, json};
+
+use crate::receiver::ReceiverEvent;
 
 /// What a menu entry does.
 #[derive(Debug, Eq, PartialEq)]

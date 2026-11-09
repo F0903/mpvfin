@@ -409,6 +409,7 @@ impl Runtime {
     /// mpv sends SHUTDOWN only after every hook continued, so none is held
     /// here (the resolve deadlines bound that wait); this queues the final stop report.
     fn shutdown(mut self) -> c_int {
+        // A held group seek is dropped on purpose: moving the group as we leave it helps no one.
         self.feed(ReceiverEvent::Shutdown);
         self.mpv.waker().disarm();
         // shortcut: a stop report queued behind a stalled request is dropped
@@ -958,7 +959,11 @@ impl Runtime {
                 self.pending_seek.hold(position, Instant::now());
             }
             ReceiverAction::Group(request) => self.submit_group(request),
-            ReceiverAction::GroupLoad { entries, index } => self.group_load(&entries, index),
+            ReceiverAction::GroupLoad { entries, index } => {
+                // A held seek was for the item being replaced.
+                self.pending_seek = PendingSeek::default();
+                self.group_load(&entries, index);
+            }
             ReceiverAction::GroupSyncPlaylist { entries, index } => {
                 for command in adapter::group_sync_commands(&entries, index) {
                     self.run(&command);

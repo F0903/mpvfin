@@ -4,9 +4,8 @@ use std::fs::{File, OpenOptions, TryLockError};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::{fmt, io, path::Path};
 
-use serde::{Deserialize, Serialize};
-
 use jellyfin::new_device_id;
+use serde::{Deserialize, Serialize};
 
 /// Persisted login and identity.
 #[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]

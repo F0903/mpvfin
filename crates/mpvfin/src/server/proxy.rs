@@ -9,13 +9,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
-use jellyfin::Secret;
+use jellyfin::{BaseUrl, Secret, new_device_id, tls_config};
 use ureq::http::Response;
 use ureq::{Agent, Body};
-
-use jellyfin::BaseUrl;
-use jellyfin::new_device_id;
-use jellyfin::tls_config;
 
 const HEAD_LIMIT: usize = 16 * 1024;
 const HEAD_READ_TIMEOUT: Duration = Duration::from_secs(10);

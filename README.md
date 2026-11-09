@@ -110,8 +110,8 @@ When someone joins, everyone waits for them and then starts together; mpv starts
 at the moment the server schedules. At the end of an item the group moves on
 together, and the group stops after the last item.
 
-Opening a local file leaves the group. If the connection drops, mpvfin rejoins
-by itself. It has been checked against Jellyfin's web client on server 10.11.11.
+Opening a local file leaves the group, and so does an item mpv can't load, with
+an OSD message. If the connection drops, mpvfin rejoins by itself. It has been checked against Jellyfin's web client on server 10.11.11.
 
 ## Uninstall
 

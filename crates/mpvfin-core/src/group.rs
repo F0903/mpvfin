@@ -353,7 +353,7 @@ impl Receiver {
         if paused && mem::take(&mut g.hold_unconfirmed) {
             return;
         }
-        // mpv pauses itself when it holds at the end of an item.
+        // Once the end is reported the server is moving on: a Pause would stop it resuming.
         if paused == g.expected_paused || g.reached_end {
             return;
         }
@@ -2134,12 +2134,12 @@ mod tests {
     }
 
     #[test]
-    fn the_pause_at_the_end_is_not_the_viewers() {
+    fn a_pause_at_the_end_is_not_sent_to_the_group() {
         let (mut r, g) = playing(&["p1", "p2"], 10);
         r.handle(reached_end(g));
         assert!(
             only_progress(&pause(&mut r, g, true)),
-            "keep-open pauses mpv, and a Pause after NextItem would stop the group resuming"
+            "a Pause after NextItem would stop the group resuming"
         );
     }
 

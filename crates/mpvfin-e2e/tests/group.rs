@@ -178,8 +178,10 @@ impl Room {
         });
     }
 
+    /// mpv's position, waiting out the moment a load has none yet.
+    #[track_caller]
     fn position(&self) -> f64 {
-        self.player.get("time-pos").as_f64().expect("time-pos")
+        poll_until(T10, || self.player.get("time-pos").as_f64())
     }
 
     /// Waits for mpv to land within `TOLERANCE` of `target`.
@@ -229,14 +231,18 @@ impl Room {
         }
     }
 
-    /// Asserts the partner hears no further command for 2 s: no echo loop. What came
-    /// before now is cleared: a `Pause` to the first to report Ready is part of the wait.
+    /// Waits 2 s and asserts no command was emitted after `last`. Older ones are left out:
+    /// a `Pause` to the first to report Ready is part of the wait.
     #[track_caller]
-    fn assert_no_more_commands(&self) {
-        self.partner.clear();
+    fn assert_quiet_after(&self, last: &Value) {
         thread::sleep(secs(2));
-        let extra = self.partner.commands();
-        assert!(extra.is_empty(), "an echo followed: {extra:?}");
+        let extra: Vec<Value> = self
+            .partner
+            .commands()
+            .into_iter()
+            .filter(|command| utc_ms(&command["EmittedAt"]) > utc_ms(&last["EmittedAt"]))
+            .collect();
+        assert!(extra.is_empty(), "the group heard more: {extra:?}");
     }
 
     fn press_skip_when_up(&self) {
@@ -255,6 +261,16 @@ fn section_active(player: &Player, section: &str) -> bool {
         .expect("input-bindings")
         .iter()
         .any(|b| b["section"] == section && b["priority"].as_i64().is_some_and(|p| p >= 0))
+}
+
+/// The plugin's transport requests since the last call. A repeat in the same direction
+/// is invisible to the partner: `Pause` in Paused goes back to its sender alone.
+fn transport_posts(relay: &SocketRelay) -> Vec<String> {
+    relay
+        .take_group_posts()
+        .into_iter()
+        .filter(|post| ["Pause", "Unpause", "Seek"].contains(&post.as_str()))
+        .collect()
 }
 
 fn playlist_item_ids(queue: &Value) -> Vec<String> {
@@ -319,6 +335,7 @@ fn creating_a_group_while_playing_publishes_the_queue() {
     r.wait_on(ids[0]);
     r.wait_mpv("playlist-count", &json!(2));
 
+    let before_create = r.position();
     choose_in_menu(&r.player, "create");
     let group = poll_until(T10, || {
         r.partner
@@ -332,7 +349,7 @@ fn creating_a_group_while_playing_publishes_the_queue() {
     assert_eq!(playlist_item_ids(&queue), &ids[..2]);
     let published = seconds(&queue["StartPositionTicks"]);
     assert!(
-        (30.0..50.0).contains(&published),
+        (before_create.max(30.0)..50.0).contains(&published),
         "the group must start where mpv was, not at {published}"
     );
 
@@ -418,7 +435,6 @@ fn unpause_starts_at_the_scheduled_time() {
     r.partner.pause();
     r.partner.wait_command("Pause", T10);
     r.wait_mpv("pause", &json!(true));
-    let paused_at = r.position();
 
     r.partner.clear();
     r.partner.unpause();
@@ -439,25 +455,28 @@ fn unpause_starts_at_the_scheduled_time() {
         early <= Duration::from_millis(150) && late <= Duration::from_millis(300),
         "started {started:?} after the broadcast, due {lead:?}"
     );
+    let commanded = seconds(&unpause["PositionTicks"]);
     assert!(
-        (r.position() - paused_at).abs() <= TOLERANCE,
-        "must start from the commanded position, {paused_at}"
+        (r.position() - commanded).abs() <= TOLERANCE,
+        "must start from the commanded position, {commanded}"
     );
 }
 
 #[test]
 #[ignore = "needs ./scripts/test-server.ps1 -Action up"]
 fn local_pause_and_seek_reach_the_group() {
-    let r = room();
+    let (r, relay) = relayed_room();
     r.join_playing(&r.items[..1], secs(0));
     thread::sleep(secs(2));
 
+    relay.take_group_posts();
     r.partner.clear();
     r.player.command(&["set", "pause", "yes"]);
     let pause = r.partner.wait_command("Pause", T10);
     let at = seconds(&pause["PositionTicks"]);
     assert!((r.position() - at).abs() <= 0.5, "paused away from {at}");
-    r.assert_no_more_commands();
+    r.assert_quiet_after(&pause);
+    assert_eq!(transport_posts(&relay), ["Pause"], "one request per action");
     assert_eq!(
         r.player.get("pause"),
         json!(true),
@@ -470,8 +489,9 @@ fn local_pause_and_seek_reach_the_group() {
     let seek = r.partner.wait_command("Seek", T10);
     let at = seconds(&seek["PositionTicks"]);
     assert!((at - 40.0).abs() <= 0.3, "the group sought to {at}");
-    r.partner.wait_command("Pause", T10);
-    r.assert_no_more_commands();
+    let pause = r.partner.wait_command("Pause", T10);
+    r.assert_quiet_after(&pause);
+    assert_eq!(transport_posts(&relay), ["Seek"], "one request per action");
     assert_eq!(r.player.get("pause"), json!(true));
     r.wait_near(40.0);
 
@@ -480,7 +500,12 @@ fn local_pause_and_seek_reach_the_group() {
     let unpause = r.partner.wait_command("Unpause", T10);
     let received = Instant::now();
     r.wait_mpv("pause", &json!(false));
-    r.assert_no_more_commands();
+    r.assert_quiet_after(&unpause);
+    assert_eq!(
+        transport_posts(&relay),
+        ["Unpause"],
+        "one request per action"
+    );
     assert_eq!(r.player.get("pause"), json!(false));
     r.assert_on_schedule(&unpause, received, TOLERANCE);
 
@@ -489,8 +514,9 @@ fn local_pause_and_seek_reach_the_group() {
     r.player.command(&["seek", "70", "absolute+exact"]);
     let seek = r.partner.wait_command("Seek", T10);
     assert!((seconds(&seek["PositionTicks"]) - 70.0).abs() <= 0.3);
-    r.partner.wait_command("Unpause", T10);
-    r.assert_no_more_commands();
+    let unpause = r.partner.wait_command("Unpause", T10);
+    r.assert_quiet_after(&unpause);
+    assert_eq!(transport_posts(&relay), ["Seek"], "one request per action");
     assert_eq!(r.player.get("pause"), json!(false));
     assert!(r.position() > 70.0, "the seek did not stick");
 }
@@ -623,7 +649,7 @@ fn skip_in_a_group_seeks_everyone() {
 #[test]
 #[ignore = "needs ./scripts/test-server.ps1 -Action up"]
 fn leaving_keeps_local_playback() {
-    let r = room();
+    let (r, relay) = relayed_room();
     r.join_playing(&r.items[..1], secs(0));
     assert_eq!(r.player.get("keep-open"), json!("always"));
 
@@ -637,7 +663,7 @@ fn leaving_keeps_local_playback() {
     assert_eq!(r.player.get("pause"), json!(false));
     assert!(r.position() > before, "playback must carry on");
 
-    // No longer a member, in either direction.
+    // A rejoin guard only: no broadcast reaches a non-member, whatever the plugin does.
     r.partner.clear();
     r.partner.pause();
     r.partner.wait_command("Pause", T10);
@@ -645,11 +671,18 @@ fn leaving_keeps_local_playback() {
     assert_eq!(
         r.player.get("pause"),
         json!(false),
-        "still following the group"
+        "mpv rejoined the group after leaving"
     );
-    r.partner.clear();
+
+    // The server would answer a non-member's request to it alone, so look at the wire.
+    relay.take_group_posts();
     r.player.command(&["set", "pause", "yes"]);
-    r.assert_no_more_commands();
+    thread::sleep(secs(2));
+    assert_eq!(
+        relay.take_group_posts(),
+        Vec::<String>::new(),
+        "a viewer who left must not ask the group for anything"
+    );
 }
 
 #[test]
@@ -665,6 +698,7 @@ fn local_file_leaves_the_group() {
     r.wait_mpv("path", &json!(local));
     r.wait_mpv("pause", &json!(false));
 
+    // A rejoin guard only: no broadcast reaches a non-member, whatever the plugin does.
     r.partner.clear();
     r.partner.pause();
     r.partner.wait_command("Pause", T10);
@@ -672,7 +706,7 @@ fn local_file_leaves_the_group() {
     assert_eq!(
         r.player.get("pause"),
         json!(false),
-        "a local file is not the group's"
+        "mpv rejoined the group after leaving"
     );
 }
 

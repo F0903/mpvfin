@@ -132,9 +132,10 @@ authority: mpv asks, and acts only on what comes back. The contract is
 5. At the end of an entry mpv holds, because of `keep-open`, and the plugin asks
    for the next one, or stops the group after the last. The server has no notion
    of an item ending.
-6. Leaving, opening a local file, or an item that cannot load takes mpv out of
-   the group; playback carries on and the entry gets the viewer's `keep-open`
-   back. After a dropped connection the session rejoins the remembered group.
+6. Leaving or opening a local file takes mpv out of the group; playback carries
+   on and the entry gets the viewer's `keep-open` back. An item that cannot load
+   also takes mpv out, with an OSD message, and mpv moves on to its next entry or
+   goes idle. After a dropped connection the session rejoins the remembered group.
 
 While playing in a group the plugin compares mpv's position with the group's
 clock, anchored at the last start. Under 120 ms is left alone. Up to 2 s, it

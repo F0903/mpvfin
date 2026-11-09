@@ -533,6 +533,10 @@ H.264) logged in as `partner`, and a real mpv running the plugin as `admin`. The
 the group and played E01; mpv joined from its menu. Only the web UI was driven, and its source was
 not read. Four runs, all alike, the last after the fix to a viewer's resume. [live]
 
+Offsets compare mpv's `time-pos` with the browser's `video.currentTime`, read together, with mpv on
+`--vo=null --ao=null` and Chrome on `--mute-audio`. They say how closely the two clocks agree, not
+what a viewer would see or hear on real outputs.
+
 | Check | Result |
 | --- | --- |
 | Browser pauses when mpv joins | within 40 ms of mpv's choice |
@@ -560,5 +564,6 @@ What the web client POSTs to `/SyncPlay/`, seen from its requests:
 - At the end of the last item of the queue, alone in the group: no request at all, neither `Stop`
   nor `NextItem`. The player closed and the item's page came back.
 
-Not checked: any other official client, `Buffering` under a real stall, and a remote `Play` while
-grouped (open question 3).
+Not checked: any other official client, `Buffering` under a real stall, a remote `Play` while
+grouped (open question 3), mpv's end-of-queue `Stop` reaching a real client, and next, previous and
+cast against the browser.

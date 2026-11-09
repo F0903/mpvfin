@@ -576,6 +576,14 @@ impl Receiver {
         }
     }
 
+    /// A failed entry abandons even with no wait on it: mpv would auto-advance
+    /// to the next entry, and that reads as the viewer picking it for everyone.
+    pub(super) fn group_item_failed(&mut self, actions: &mut Vec<ReceiverAction>) {
+        if self.group_on_item().is_some() {
+            self.abandon_group(actions);
+        }
+    }
+
     /// mpv ends an entry with a stop before it opens the next one, so the
     /// decision waits for an opening, or for mpv going idle.
     pub(super) fn group_load_stopped(&mut self) {
@@ -597,8 +605,12 @@ impl Receiver {
             .is_some_and(|g| (g.awaiting_ready || g.buffering) && g.current_pid == self.opened_pid)
     }
 
+    /// mpv's `stop` also clears the mirrored queue, which it would play on through alone.
     fn abandon_group(&mut self, actions: &mut Vec<ReceiverAction>) {
         self.group_leave(actions);
+        if let Some(generation) = Generation::new(self.next_generation - 1) {
+            actions.push(ReceiverAction::StopPlayer { generation });
+        }
         actions.push(ReceiverAction::ShowMessage {
             text: "mpvfin: couldn't load that item, so you've left the group".to_owned(),
         });
@@ -1408,10 +1420,65 @@ mod tests {
     fn left_for_a_failed_load(g: Generation) -> Vec<ReceiverAction> {
         let mut left = vec![ReceiverAction::Group(GroupRequest::Leave)];
         left.extend(stop_following(g));
+        left.push(ReceiverAction::StopPlayer { generation: g });
         left.push(ReceiverAction::ShowMessage {
             text: "mpvfin: couldn't load that item, so you've left the group".into(),
         });
         left
+    }
+
+    #[test]
+    fn a_failed_entry_abandons_the_group_with_no_ready_owed() {
+        let (mut r, g) = playing(&["p1", "p2"], 10);
+        let actions = r.handle(ended(g, EndReason::Failed("x".into())));
+        assert!(
+            matches!(
+                actions.as_slice(),
+                [ReceiverAction::ReportStopped { .. }, ReceiverAction::PlaybackFailed { .. }, rest @ ..]
+                    if rest == left_for_a_failed_load(g).as_slice()
+            ),
+            "{actions:?}"
+        );
+        assert_eq!(r.group_id(), None);
+        assert!(
+            requests(&open_pid(&mut r, "p2", 80)).is_empty(),
+            "mpv moving on is no longer the group's business"
+        );
+    }
+
+    #[test]
+    fn a_failed_resolve_abandons_the_group_with_no_ready_owed() {
+        let (mut r, _) = following("p1", 10);
+        r.handle(queue(
+            QueueReason::RemoveItems,
+            200,
+            &["p2", "p3"],
+            Some(0),
+            secs(0),
+            true,
+        ));
+        open_pid(&mut r, "p2", 80);
+        let actions = r.handle(ReceiverEvent::MediaResolutionFailed {
+            generation: gen_(2),
+            message: "boom".into(),
+        });
+        assert!(
+            matches!(
+                actions.as_slice(),
+                [ReceiverAction::AbortLoad { hook_id: 80 }, ReceiverAction::PlaybackFailed { .. }, rest @ ..]
+                    if rest == left_for_a_failed_load(gen_(2)).as_slice()
+            ),
+            "{actions:?}"
+        );
+    }
+
+    #[test]
+    fn a_failed_entry_the_group_has_moved_on_from_keeps_the_group() {
+        let (mut r, g) = following_in(&["p1", "p2"], 10);
+        r.handle(new_queue(200, &["p3"], 0, secs(0)));
+        let actions = r.handle(ended(g, EndReason::Failed("x".into())));
+        assert!(!actions.contains(&req(GroupRequest::Leave)), "{actions:?}");
+        assert_eq!(r.group_id(), Some("g"));
     }
 
     #[test]

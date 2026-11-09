@@ -817,7 +817,7 @@ impl Receiver {
                         item_id,
                         message,
                     });
-                    self.group_load_ended(&mut actions);
+                    self.group_item_failed(&mut actions);
                 }
                 other => self.playback = other,
             },
@@ -910,10 +910,12 @@ impl Receiver {
                             message,
                         });
                     }
-                    if stop == StopReason::Stopped {
-                        self.group_load_stopped();
-                    } else {
-                        self.group_load_ended(&mut actions);
+                    match stop {
+                        StopReason::Stopped => self.group_load_stopped(),
+                        StopReason::Failed => self.group_item_failed(&mut actions),
+                        StopReason::Ended | StopReason::Shutdown => {
+                            self.group_load_ended(&mut actions);
+                        }
                     }
                 }
             }

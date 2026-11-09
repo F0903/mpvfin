@@ -493,6 +493,8 @@ impl Receiver {
     ) {
         if self.playing_mut(generation).is_some() && self.group_on_item().is_some() {
             self.group_leave(actions);
+            // Or, with `keep-open` restored, mpv plays on through the group's queue alone.
+            actions.push(ReceiverAction::StopPlayer { generation });
             actions.push(ReceiverAction::ShowMessage {
                 text: "mpvfin: the stream stopped early, so you've left the group".to_owned(),
             });
@@ -1617,6 +1619,7 @@ mod tests {
         let (mut r, g) = playing(&["p1", "p2"], 10);
         let mut left = vec![req(GroupRequest::Leave)];
         left.extend(stop_following(g));
+        left.push(ReceiverAction::StopPlayer { generation: g });
         left.push(ReceiverAction::ShowMessage {
             text: "mpvfin: the stream stopped early, so you've left the group".into(),
         });

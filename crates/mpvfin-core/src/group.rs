@@ -482,6 +482,20 @@ impl Receiver {
         }));
     }
 
+    /// A dead link is this viewer's problem: `NextItem` would move everyone on.
+    pub(super) fn group_stopped_early(
+        &mut self,
+        generation: Generation,
+        actions: &mut Vec<ReceiverAction>,
+    ) {
+        if self.playing_mut(generation).is_some() && self.group_on_item().is_some() {
+            self.group_leave(actions);
+            actions.push(ReceiverAction::ShowMessage {
+                text: "mpvfin: the stream stopped early, so you've left the group".to_owned(),
+            });
+        }
+    }
+
     pub(super) fn group_buffering(
         &mut self,
         generation: Generation,
@@ -1495,6 +1509,41 @@ mod tests {
         assert_eq!(
             r.handle(ReceiverEvent::PlayerIdle),
             left_for_a_failed_load(g)
+        );
+    }
+
+    #[test]
+    fn a_stream_stopped_early_leaves_without_moving_the_group() {
+        let (mut r, g) = playing(&["p1", "p2"], 10);
+        let mut left = vec![req(GroupRequest::Leave)];
+        left.extend(stop_following(g));
+        left.push(ReceiverAction::ShowMessage {
+            text: "mpvfin: the stream stopped early, so you've left the group".into(),
+        });
+        assert_eq!(
+            r.handle(ReceiverEvent::PlayerStoppedEarly { generation: g }),
+            left,
+            "no NextItem or Stop for the others"
+        );
+        assert_eq!(r.group_id(), None);
+    }
+
+    #[test]
+    fn an_early_stop_of_anything_but_the_groups_item_is_ignored() {
+        let (mut r, g) = playing(&["p1"], 10);
+        r.handle(new_queue(200, &["p2"], 0, secs(0)));
+        assert!(
+            r.handle(ReceiverEvent::PlayerStoppedEarly { generation: g })
+                .is_empty(),
+            "that end is p1's, and the group has moved on"
+        );
+        assert_eq!(r.group_id(), Some("g"));
+
+        let mut r = Receiver::new();
+        let g = begin_playing(&mut r, "a", 70);
+        assert!(
+            r.handle(ReceiverEvent::PlayerStoppedEarly { generation: g })
+                .is_empty()
         );
     }
 

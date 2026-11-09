@@ -547,7 +547,7 @@ impl Runtime {
                 if o.eof_reached
                     && let Some(generation) = self.current_generation()
                 {
-                    self.feed(ReceiverEvent::PlayerReachedEnd { generation });
+                    self.feed(self.end_event(generation));
                 }
                 return;
             }
@@ -571,6 +571,18 @@ impl Runtime {
         }
         if name == "time-pos" {
             self.correct_drift();
+        }
+    }
+
+    fn end_event(&self, generation: Generation) -> ReceiverEvent {
+        // mpv delivers events ahead of property changes, so ask for the position.
+        let position = parse_position(self.mpv.get_property("time-pos").as_deref())
+            .unwrap_or(self.observed.position);
+        let duration = parse_position(self.mpv.get_property("duration").as_deref());
+        if adapter::is_true_end(position, duration) {
+            ReceiverEvent::PlayerReachedEnd { generation }
+        } else {
+            ReceiverEvent::PlayerStoppedEarly { generation }
         }
     }
 

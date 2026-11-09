@@ -293,6 +293,13 @@ pub fn end_reason(reason: c_int, error: Option<String>) -> EndReason {
     }
 }
 
+/// Whether `eof-reached` came at the item's end, not from a stream giving out
+/// early; an unknown duration counts as the end.
+#[must_use]
+pub fn is_true_end(position: Duration, duration: Option<Duration>) -> bool {
+    duration.is_none_or(|d| d.saturating_sub(position) <= Duration::from_secs(2))
+}
+
 /// Seeks to an absolute position. Exact, because with `hr-seek=no` a plain seek
 /// lands on a keyframe, possibly inside the segment being skipped.
 #[must_use]
@@ -317,6 +324,17 @@ mod tests {
         MPV_END_FILE_REASON_QUIT, MPV_END_FILE_REASON_REDIRECT, MPV_END_FILE_REASON_STOP,
     };
     use mpvfin_core::{Generation, GroupEntry, PlayMethod, TrackMap};
+
+    #[test]
+    fn a_true_end_is_within_two_seconds_of_the_duration() {
+        let ms = Duration::from_millis;
+        let length = Some(ms(100_000));
+        assert!(is_true_end(ms(100_000), length));
+        assert!(is_true_end(ms(98_000), length));
+        assert!(!is_true_end(ms(97_999), length), "stopped early");
+        assert!(is_true_end(ms(105_000), length), "past the known length");
+        assert!(is_true_end(ms(3_000), None), "unknown duration");
+    }
 
     fn cmd(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|s| (*s).to_owned()).collect()

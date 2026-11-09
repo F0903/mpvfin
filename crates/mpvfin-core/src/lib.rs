@@ -397,6 +397,11 @@ pub enum ReceiverEvent {
         /// Playback generation.
         generation: Generation,
     },
+    /// mpv ran out of stream well before the item's end.
+    PlayerStoppedEarly {
+        /// Playback generation.
+        generation: Generation,
+    },
     /// mpv paused for the cache, or resumed from it.
     PlayerBuffering {
         /// Playback generation.
@@ -999,6 +1004,9 @@ impl Receiver {
             }
             ReceiverEvent::PlayerReachedEnd { generation } => {
                 self.group_reached_end(generation, &mut actions);
+            }
+            ReceiverEvent::PlayerStoppedEarly { generation } => {
+                self.group_stopped_early(generation, &mut actions);
             }
             ReceiverEvent::PlayerBuffering {
                 generation,

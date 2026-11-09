@@ -47,6 +47,30 @@ const UOSC_MENU: &str = "user-data/uosc/menu/type";
 /// How long a message about the group stays on the OSD.
 const MESSAGE_DURATION: Duration = Duration::from_secs(5);
 
+/// How long a group seek waits for a newer one: a timeline drag is one seek
+/// per step, and each broadcast would pull the playhead back.
+const GROUP_SEEK_DEBOUNCE: Duration = Duration::from_millis(250);
+
+/// A group seek held back by the debounce.
+#[derive(Default)]
+struct PendingSeek(Option<(Instant, Duration)>);
+
+impl PendingSeek {
+    /// Holds `position`, replacing any seek already held.
+    fn hold(&mut self, position: Duration, now: Instant) {
+        self.0 = Some((now + GROUP_SEEK_DEBOUNCE, position));
+    }
+
+    fn due_at(&self) -> Option<Instant> {
+        self.0.map(|(at, _)| at)
+    }
+
+    /// The held seek, once.
+    fn flush(&mut self) -> Option<Duration> {
+        self.0.take().map(|(_, position)| position)
+    }
+}
+
 /// Runs the plugin until mpv shuts down; the entry point's return value.
 pub fn run(mpv: Mpv) -> c_int {
     mpv.log("loaded");
@@ -108,6 +132,7 @@ pub fn run(mpv: Mpv) -> c_int {
         skip_button: None,
         skip_sections_off_at: None,
         resume_at: None,
+        pending_seek: PendingSeek::default(),
         drift: DriftCorrector::new(),
         drift_generation: None,
         seeking: false,
@@ -258,6 +283,7 @@ struct Runtime {
     skip_sections_off_at: Option<Instant>,
     /// When a group's scheduled start is due, for that generation.
     resume_at: Option<(Instant, Generation)>,
+    pending_seek: PendingSeek,
     drift: DriftCorrector,
     /// The generation the drift corrector follows.
     drift_generation: Option<Generation>,
@@ -286,10 +312,15 @@ impl Runtime {
                 .filter(|pending| !pending.expired)
                 .map(|pending| pending.deadline);
             let resume = self.resume_at.map(|(at, _)| at);
-            let wake = [resolve, self.skip_sections_off_at, resume]
-                .into_iter()
-                .flatten()
-                .fold(next_tick, Instant::min);
+            let wake = [
+                resolve,
+                self.skip_sections_off_at,
+                resume,
+                self.pending_seek.due_at(),
+            ]
+            .into_iter()
+            .flatten()
+            .fold(next_tick, Instant::min);
             let timeout = wake.saturating_duration_since(Instant::now());
             let Some(event) = self.mpv.wait_event(timeout.as_secs_f64()).map(Event::read) else {
                 self.mpv.log("mpv_wait_event returned no event");
@@ -341,6 +372,7 @@ impl Runtime {
             self.expire_resolve();
             self.expire_skip_sections();
             self.expire_resume();
+            self.expire_group_seek();
             if Instant::now() >= next_tick {
                 next_tick = Instant::now() + TICK;
                 self.feed(ReceiverEvent::ProgressTick);
@@ -430,6 +462,29 @@ impl Runtime {
             self.resume_at = None;
             self.feed(ReceiverEvent::GroupResumeDue { generation });
         }
+    }
+
+    fn expire_group_seek(&mut self) {
+        if self
+            .pending_seek
+            .due_at()
+            .is_some_and(|at| Instant::now() >= at)
+        {
+            self.flush_group_seek();
+        }
+    }
+
+    fn flush_group_seek(&mut self) {
+        if let Some(position) = self.pending_seek.flush() {
+            self.session
+                .submit(Job::Group(GroupRequest::Seek { position }));
+        }
+    }
+
+    /// Sends a request after any held seek, so it can't overtake that seek.
+    fn submit_group(&mut self, request: GroupRequest) {
+        self.flush_group_seek();
+        self.session.submit(Job::Group(request));
     }
 
     fn on_load(&mut self, hook_id: u64) {
@@ -712,6 +767,11 @@ impl Runtime {
         if grouped != was_grouped {
             self.apply_group_keep_open(grouped);
         }
+        if !grouped {
+            // Out of the group a held seek has no one to go to; the server
+            // would answer NotInGroup and the viewer would be told so.
+            self.pending_seek = PendingSeek::default();
+        }
     }
 
     /// The group hook makes its entry wait at the end for the server. Out of
@@ -894,7 +954,10 @@ impl Runtime {
                 self.mpv
                     .show_text(&format!("mpvfin: {message}"), Duration::from_secs(5));
             }
-            ReceiverAction::Group(request) => self.session.submit(Job::Group(request)),
+            ReceiverAction::Group(GroupRequest::Seek { position }) => {
+                self.pending_seek.hold(position, Instant::now());
+            }
+            ReceiverAction::Group(request) => self.submit_group(request),
             ReceiverAction::GroupLoad { entries, index } => self.group_load(&entries, index),
             ReceiverAction::GroupSyncPlaylist { entries, index } => {
                 for command in adapter::group_sync_commands(&entries, index) {
@@ -938,7 +1001,7 @@ impl Runtime {
         }
     }
 
-    fn publish_queue(&self, position: Duration) {
+    fn publish_queue(&mut self, position: Duration) {
         let number = |name: &str| self.mpv.get_property(name)?.parse::<usize>().ok();
         // Unavailable entries stay as blanks, so positions stay meaningful.
         let filenames: Vec<String> = (0..number("playlist/count").unwrap_or(0))
@@ -950,11 +1013,11 @@ impl Runtime {
             .collect();
         let current = number("playlist-playing-pos").unwrap_or(0);
         let (item_ids, index) = adapter::published_queue(&filenames, current);
-        self.session.submit(Job::Group(GroupRequest::SetNewQueue {
+        self.submit_group(GroupRequest::SetNewQueue {
             item_ids,
             index,
             start: position,
-        }));
+        });
     }
 
     fn select_track(&self, generation: Generation, kind: TrackKind, index: i32) {
@@ -1110,6 +1173,25 @@ fn percent(volume: f64) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_newer_seek_replaces_the_held_one_and_restarts_its_wait() {
+        let secs = Duration::from_secs;
+        let t0 = Instant::now();
+        let mut pending = PendingSeek::default();
+        assert_eq!(pending.due_at(), None);
+
+        pending.hold(secs(10), t0);
+        assert_eq!(pending.due_at(), Some(t0 + GROUP_SEEK_DEBOUNCE));
+
+        let later = t0 + Duration::from_millis(120);
+        pending.hold(secs(20), later);
+        assert_eq!(pending.due_at(), Some(later + GROUP_SEEK_DEBOUNCE));
+
+        assert_eq!(pending.flush(), Some(secs(20)));
+        assert_eq!(pending.flush(), None, "sent once");
+        assert_eq!(pending.due_at(), None, "and no wake left behind");
+    }
 
     #[test]
     fn a_missing_or_zero_osd_counts_as_720p() {

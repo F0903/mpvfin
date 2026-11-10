@@ -1,0 +1,44 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Check the tag matches the crate version
+        run: |
+          $version = ((cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages |
+              Where-Object name -eq 'mpvfin').version
+          if ("v$version" -ne $env:GITHUB_REF_NAME) {
+              Write-Output "::error::Tag $env:GITHUB_REF_NAME does not match the mpvfin crate version $version"
+              exit 1
+          }
+
+      - name: Update Rust
+        run: rustup update stable --no-self-update
+
+      - name: Test
+        run: cargo test --workspace --locked
+
+      - name: Build
+        run: cargo build --release --locked -p mpvfin
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $hash = (Get-FileHash target/release/mpvfin.dll -Algorithm SHA256).Hash.ToLower()
+          Write-Output "SHA-256 of mpvfin.dll: $hash"
+          gh release create $env:GITHUB_REF_NAME target/release/mpvfin.dll --title $env:GITHUB_REF_NAME `
+              --notes "SHA-256 of ``mpvfin.dll``: ``$hash``"

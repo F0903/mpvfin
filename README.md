@@ -168,6 +168,13 @@ Set `MPVFIN_E2E_MPV` or `MPVFIN_E2E_SERVER` to use another mpv or server.
 `./scripts/test-server.ps1 -Action down` stops the server, and `-Action reset`
 deletes its data.
 
+### Releasing
+
+Set `version` in the root `Cargo.toml`, build once so `Cargo.lock` follows, and
+commit both. Then push a matching tag (`v0.2.0` for `0.2.0`). The release
+workflow checks that they match, runs the tests, and publishes `mpvfin.dll`
+with its SHA-256.
+
 See [docs/architecture.md](docs/architecture.md) for how it works and
 [docs/jellyfin-protocol.md](docs/jellyfin-protocol.md) for the wire contract.
 

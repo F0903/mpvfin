@@ -32,6 +32,7 @@ fn media(item_id: &str) -> ResolvedMedia {
         play_method: PlayMethod::DirectPlay,
         external_subtitles: Vec::new(),
         tracks: TrackMap::default(),
+        defaults: StreamSelection::default(),
     }
 }
 

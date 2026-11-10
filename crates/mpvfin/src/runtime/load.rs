@@ -64,14 +64,17 @@ pub fn sub_add_commands(media: &ResolvedMedia) -> Vec<Vec<String>> {
         .collect()
 }
 
-/// Commands applying the selection; they run after the `sub-add` commands.
+/// Commands applying the selection, with the server's defaults for streams it
+/// leaves out; they run after the `sub-add` commands.
 #[must_use]
 pub fn selection_commands(media: &ResolvedMedia, selection: &StreamSelection) -> Vec<Vec<String>> {
     let audio = selection
         .audio
+        .or(media.defaults.audio)
         .and_then(|index| track_command(media, TrackKind::Audio, index));
     let subtitle = selection
         .subtitle
+        .or(media.defaults.subtitle)
         .and_then(|index| track_command(media, TrackKind::Subtitle, index));
     audio.into_iter().chain(subtitle).collect()
 }
@@ -221,6 +224,7 @@ mod tests {
                 audio: vec![1, 2],
                 subtitles: vec![3, 4, 5],
             },
+            defaults: StreamSelection::default(),
         }
     }
     #[test]
@@ -282,6 +286,32 @@ mod tests {
         assert_eq!(
             selection_commands(&m, &off),
             vec![cmd(&["set", "file-local-options/sid", "no"])]
+        );
+    }
+    #[test]
+    fn the_servers_defaults_fill_what_the_controller_left_out() {
+        let mut m = media();
+        m.defaults = StreamSelection {
+            audio: Some(1),
+            subtitle: Some(5),
+        };
+        assert_eq!(
+            selection_commands(&m, &StreamSelection::default()),
+            vec![
+                cmd(&["set", "file-local-options/aid", "1"]),
+                cmd(&["set", "file-local-options/sid", "3"]),
+            ]
+        );
+        let off = StreamSelection {
+            audio: None,
+            subtitle: Some(-1),
+        };
+        assert_eq!(
+            selection_commands(&m, &off),
+            vec![
+                cmd(&["set", "file-local-options/aid", "1"]),
+                cmd(&["set", "file-local-options/sid", "no"]),
+            ]
         );
     }
     #[test]

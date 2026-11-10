@@ -6,6 +6,7 @@ use crate::client::{Client, HttpError};
 use crate::identity::pct;
 use crate::playback::items::display_title;
 use crate::playback::profile::playback_info_body;
+use crate::remote::StreamSelection;
 use crate::url::BaseUrl;
 
 /// Jellyfin stream indices in track order; a track's number is its position + 1.
@@ -83,6 +84,9 @@ pub struct ResolvedMedia {
     pub external_subtitles: Vec<String>,
     /// Which stream each track is.
     pub tracks: TrackMap,
+    /// The server's picks from the user's language settings and remembered
+    /// choices, for the streams a controller leaves out.
+    pub defaults: StreamSelection,
 }
 
 /// Drops every `ApiKey`/`api_key` query parameter (case-insensitive).
@@ -175,6 +179,10 @@ pub fn resolve_media(
         .filter_map(|s| s.3)
         .map(|u| base.join(&strip_api_key(u)))
         .collect();
+    let default = |key: &str| {
+        let index = source.get(key).and_then(Value::as_i64)?;
+        i32::try_from(index).ok()
+    };
 
     Ok(ResolvedMedia {
         item_id: item_id.to_owned(),
@@ -187,6 +195,10 @@ pub fn resolve_media(
         play_method: PlayMethod::DirectPlay,
         external_subtitles,
         tracks: TrackMap { audio, subtitles },
+        defaults: StreamSelection {
+            audio: default("DefaultAudioStreamIndex"),
+            subtitle: default("DefaultSubtitleStreamIndex"),
+        },
     })
 }
 
@@ -308,6 +320,21 @@ mod tests {
             resolve(&i).unwrap_err(),
             "Jellyfin refused playback: NotAllowed"
         );
+    }
+    #[test]
+    fn keeps_the_servers_default_streams() {
+        let mut s = source(&json!([]));
+        s["DefaultAudioStreamIndex"] = json!(1);
+        s["DefaultSubtitleStreamIndex"] = json!(-1);
+        assert_eq!(
+            resolve(&info(&s)).unwrap().defaults,
+            StreamSelection {
+                audio: Some(1),
+                subtitle: Some(-1),
+            }
+        );
+        let none = resolve(&info(&source(&json!([])))).unwrap();
+        assert_eq!(none.defaults, StreamSelection::default());
     }
     #[test]
     fn track_map_round_trips_embedded_and_external_indices() {

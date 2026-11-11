@@ -149,6 +149,11 @@ verified against that image, all unauthenticated until login:
 - Stream indices are not grouped: the external `fr` subtitle has `Index 0`
   (before video 1, audio 2-3, embedded subtitles 4-5). Mapping therefore sorts
   by `Index` and puts embedded subtitles before external ones.
+- The source also has `DefaultAudioStreamIndex` and
+  `DefaultSubtitleStreamIndex`, the server's picks from the user's language
+  settings and the streams' default flags. On S01E01, for a user with no
+  language settings, they are `2` and `4`, the English streams flagged as
+  default. mpvfin uses them for any stream a cast leaves out.
 - Only the external subtitle has `DeliveryUrl`, e.g.
   `/Videos/{guid}/{sourceId}/Subtitles/0/0/Stream.subrip?ApiKey=<access token>`.
   It does carry the API key, so mpvfin strips every `ApiKey`/`api_key`
